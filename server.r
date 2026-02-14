@@ -1,30 +1,83 @@
 library(shiny)
-library(ggplot2)
+library(shinyMobile)
+library(leaflet)
 
-function(input, output) {
+server <- function(input, output, session) {
 
-  dataset <- reactive({
-    diamonds[sample(nrow(diamonds), input$sampleSize),]
+  # ---- Base map (NO zoom +/- buttons) ----
+  output$map <- renderLeaflet({
+    leaflet(
+      options = leafletOptions(
+        zoomControl = FALSE,        # removes + / − buttons
+        attributionControl = FALSE
+      )
+    ) %>%
+      addProviderTiles("Esri.WorldStreetMap") %>%
+      setView(lng = -92.36, lat = 38.95, zoom = 12)
   })
 
-  output$plot <- renderPlot({
+  # ---- Settings popup ----
+  observeEvent(input$btn_settings, {
+    f7Popup(
+      id = "settings_popup",
+      title = "Settings",
 
-    p <- ggplot(dataset(), aes_string(x=input$x, y=input$y)) + geom_point()
+      f7Block(strong = TRUE, "Search Distance"),
 
-    if (input$color != 'None')
-      p <- p + aes_string(color=input$color)
+      f7Slider(
+        inputId = "search_distance",
+        label = NULL,
+        min = 5,
+        max = 100,
+        value = 20,
+        step = 5
+      ),
 
-      facets <- paste(input$facet_row, '~', input$facet_col)
-      if (facets != '. ~ .')
-        p <- p + facet_grid(facets)
+      f7BlockFooter("Used to limit nearby search results and alerts.")
+    )
+  })
 
-        if (input$jitter)
-          p <- p + geom_jitter()
-          if (input$smooth)
-            p <- p + geom_smooth()
+  # ---- Search (geocode + circle) ----
+  observeEvent(input$q, {
+    req(nzchar(trimws(input$q)))
 
-            print(p)
+    if (!requireNamespace("tidygeocoder", quietly = TRUE)) {
+      showNotification("Install 'tidygeocoder' to enable search.", type = "warning")
+      return()
+    }
 
-  }, height=700)
+    query <- trimws(input$q)
 
+    res <- tryCatch({
+      tidygeocoder::geocode(
+        data.frame(address = query),
+        address = address,
+        method = "osm",
+        quiet = TRUE
+      )
+    }, error = function(e) NULL)
+
+    if (is.null(res) || anyNA(res$lat) || anyNA(res$long)) {
+      showNotification("No results found.", type = "error")
+      return()
+    }
+
+    lat <- res$lat[1]
+    lon <- res$long[1]
+    dist <- input$search_distance %||% 20
+
+    leafletProxy("map") %>%
+      clearMarkers() %>%
+      clearShapes() %>%
+      setView(lng = lon, lat = lat, zoom = 15) %>%
+      addCircleMarkers(lng = lon, lat = lat, radius = 6) %>%
+      addCircles(
+        lng = lon, lat = lat,
+        radius = dist,
+        fillOpacity = 0.15
+      )
+  })
+
+  # No overlay panel for now
+  output$panel_ui <- renderUI(NULL)
 }
