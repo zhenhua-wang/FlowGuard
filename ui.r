@@ -60,7 +60,6 @@ ui <- f7Page(
           rand: Math.random()
         });
         
-        // 发送完毕后清除坐标属性，避免后续打字搜索时误用
         $('#q_input').removeAttr('data-clicked-lat');
         $('#q_input').removeAttr('data-clicked-lon');
       }
@@ -71,7 +70,6 @@ ui <- f7Page(
         $(document).on('focus input', '#start_input, #q_input', function() {
           activeInputId = $(this).attr('id'); 
           
-          // 如果用户手动修改了输入框，清除之前绑定的地图点击精确坐标
           if (activeInputId === 'q_input') {
              $(this).removeAttr('data-clicked-lat');
              $(this).removeAttr('data-clicked-lon');
@@ -112,34 +110,82 @@ ui <- f7Page(
         });
       });
 
+      // --- 【更新：状态解耦的 JS 通讯，支持 Medium 字符】 ---
       Shiny.addCustomMessageHandler('start_nav_ui', function(msg) {
          $('#nav_time').text(msg.time + ' min');
          $('#nav_dist').text(msg.dist + ' mi');
          $('#bottom_tray').addClass('nav-active');   
          $('#nav_info_panel').addClass('active');    
+         
+         // 导航开始时拉宽并设为 Low
+         $('#risk_btn').removeClass('risk-medium risk-high').addClass('risk-active risk-low');
+         $('#risk_text').text('Low');
       });
+      
       Shiny.addCustomMessageHandler('end_nav_ui', function(msg) {
          $('#nav_info_panel').removeClass('active'); 
          $('#bottom_tray').removeClass('nav-active'); 
+         
+         // 导航结束时恢复原状（无光、无字、纯圆）
+         $('#risk_btn').removeClass('risk-active risk-low risk-medium risk-high');
+      });
+      
+      Shiny.addCustomMessageHandler('update_risk_level', function(msg) {
+         let level = msg.level; // 'Low', 'Medium', 'High', 'Off'
+         $('#risk_btn').removeClass('risk-active risk-low risk-medium risk-high');
+         
+         if (level === 'Low') {
+           $('#risk_btn').addClass('risk-active risk-low');
+           $('#risk_text').text('Low');
+         } else if (level === 'Medium') {
+           $('#risk_btn').addClass('risk-active risk-medium');
+           $('#risk_text').text('Medium');
+         } else if (level === 'High') {
+           $('#risk_btn').addClass('risk-active risk-high');
+           $('#risk_text').text('High');
+         }
+         // 如果是 Off，就什么类都不加，自动恢复原样
       });
     ")),
 
-    tags$style(HTML("body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; overflow: hidden; }
+    # --- 自定义 CSS ---
+    tags$style(HTML("
+      body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; overflow: hidden; }
       #fg-map { position: fixed; top: 0; bottom: 0; left: 0; right: 0; z-index: 1; }
 
       :root {
-        --ios-glass-bg: rgba(255, 255, 255, 0.45); --ios-glass-blur: blur(35px) saturate(190%);
-        --ios-glass-border: 1px solid rgba(255, 255, 255, 0.5); --ios-glass-shadow: 0 10px 30px rgba(0,0,0,0.15);
+        --ios-glass-bg: rgba(255, 255, 255, 0.45); 
+        --ios-glass-blur: blur(35px) saturate(190%);
+        --ios-glass-border: 1px solid rgba(255, 255, 255, 0.5); 
+        --ios-glass-shadow: 0 10px 30px rgba(0,0,0,0.15);
       }
 
-      .material-symbols-rounded { font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24; font-size: 28px; color: #000; display: flex; align-items: center; justify-content: center; }
+      .material-symbols-rounded { 
+        font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24; 
+        font-size: 28px; display: flex; align-items: center; justify-content: center; 
+        transition: color 0.4s ease;
+      }
+      
+      /* 默认情况下的图标颜色 */
+      .risk-indicator .material-symbols-rounded { color: #000; }
 
-      .ios-panel { position: fixed; z-index: 10001; background: var(--ios-glass-bg) !important; backdrop-filter: var(--ios-glass-blur); -webkit-backdrop-filter: var(--ios-glass-blur); border: var(--ios-glass-border); box-shadow: 0 25px 50px rgba(0,0,0,0.2); opacity: 0; pointer-events: none; transition: transform 0.4s cubic-bezier(0.19, 1, 0.22, 1), opacity 0.4s ease; padding: 26px; box-sizing: border-box; display: flex; flex-direction: column; backface-visibility: hidden; }
+      .ios-panel { 
+        position: fixed; z-index: 10001; background: var(--ios-glass-bg) !important; 
+        backdrop-filter: var(--ios-glass-blur); -webkit-backdrop-filter: var(--ios-glass-blur); 
+        border: var(--ios-glass-border); box-shadow: 0 25px 50px rgba(0,0,0,0.2); 
+        opacity: 0; pointer-events: none; 
+        transition: transform 0.4s cubic-bezier(0.19, 1, 0.22, 1), opacity 0.4s ease; 
+        padding: 26px; box-sizing: border-box; display: flex; flex-direction: column; backface-visibility: hidden; 
+      }
       .ios-panel.active { opacity: 1; pointer-events: auto; }
       
       .panel-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 22px; }
       .panel-title { font-size: 24px; font-weight: 800; color: #000; margin: 0; }
-      .panel-close-btn { background: rgba(0,0,0,0.06) !important; border: none; width: 30px; height: 30px; border-radius: 50%; color: #555; font-size: 22px; display: flex; align-items: center; justify-content: center; cursor: pointer; transform: translateZ(0); outline: none !important; }
+      .panel-close-btn { 
+        background: rgba(0,0,0,0.06) !important; border: none; width: 30px; height: 30px; 
+        border-radius: 50%; color: #555; font-size: 22px; display: flex; align-items: center; 
+        justify-content: center; cursor: pointer; transform: translateZ(0); outline: none !important; 
+      }
       
       #risk_panel { top: 16px; left: 12px; right: 12px; height: 45vh; border-radius: 28px; transform-origin: 23px 23px; transform: scale(0); padding: 0; overflow: hidden;}
       #risk_panel.active { transform: scale(1); }
@@ -186,20 +232,93 @@ ui <- f7Page(
       .ios-switch input:checked + .ios-slider-toggle { background-color: #34c759; }
       .ios-switch input:checked + .ios-slider-toggle:before { transform: translateX(20px); }
 
-      .risk-indicator { position: fixed; top: 16px; left: 12px; width: 46px; height: 46px; z-index: 999999 !important; background: var(--ios-glass-bg) !important; backdrop-filter: var(--ios-glass-blur); -webkit-backdrop-filter: var(--ios-glass-blur); border: var(--ios-glass-border); border-radius: 14px; box-shadow: var(--ios-glass-shadow); display: flex; justify-content: center; align-items: center; padding: 0; outline: none; border: none; cursor: pointer; transform: translateZ(0); transition: transform 0.6s cubic-bezier(0.19, 1, 0.22, 1); }
-      .risk-indicator.panel-open { transform: translateY(-100px) scale(0.8); pointer-events: none; transition: transform 0.4s cubic-bezier(0.19, 1, 0.22, 1); }
+      /* ========================================================= */
+      /* --- 核心动画与动态风险状态 UI (依据 Medium 最长字符适配) --- */
+      /* ========================================================= */
       
-      .fg-bottombar { position: fixed; bottom: 32px; left: 0; right: 0; z-index: 999998 !important; display: flex; align-items: center; justify-content: center; gap: 14px; pointer-events: none; transition: transform 0.6s cubic-bezier(0.19, 1, 0.22, 1); }
-      .fg-bottombar.panel-open, .fg-bottombar.nav-active { transform: translateY(150px); pointer-events: none; transition: transform 0.4s cubic-bezier(0.19, 1, 0.22, 1); }
+      @keyframes glow-low { 0% { box-shadow: 0 0 0 0 rgba(52, 199, 89, 0.5); } 70% { box-shadow: 0 0 0 15px rgba(52, 199, 89, 0); } 100% { box-shadow: 0 0 0 0 rgba(52, 199, 89, 0); } }
+      @keyframes glow-medium { 0% { box-shadow: 0 0 0 0 rgba(255, 204, 0, 0.6); } 70% { box-shadow: 0 0 0 15px rgba(255, 204, 0, 0); } 100% { box-shadow: 0 0 0 0 rgba(255, 204, 0, 0); } }
+      @keyframes glow-high { 0% { box-shadow: 0 0 0 0 rgba(255, 59, 48, 0.6); } 70% { box-shadow: 0 0 0 15px rgba(255, 59, 48, 0); } 100% { box-shadow: 0 0 0 0 rgba(255, 59, 48, 0); } }
 
-      .fg-iconbtn, .fg-search-trigger { pointer-events: auto; background: var(--ios-glass-bg) !important; backdrop-filter: var(--ios-glass-blur); -webkit-backdrop-filter: var(--ios-glass-blur); border: var(--ios-glass-border); box-shadow: var(--ios-glass-shadow); transform: translateZ(0); }
-      .fg-iconbtn { width: 46px; height: 46px; border-radius: 23px; display: flex; align-items: center; justify-content: center; border:none; outline: none;}
-      .fg-search-trigger { width: 65%; max-width: 320px; height: 46px; border-radius: 23px; display: flex; justify-content: space-between; align-items: center; padding: 0 16px 0 20px; color: #666; font-size: 16px; font-weight: 500; cursor: pointer; }
+      .risk-indicator { 
+        position: fixed; top: 16px; left: 12px; height: 46px; width: 46px; z-index: 999999 !important; 
+        background: var(--ios-glass-bg) !important; backdrop-filter: var(--ios-glass-blur); 
+        -webkit-backdrop-filter: var(--ios-glass-blur); border: var(--ios-glass-border); border-radius: 23px; 
+        box-shadow: var(--ios-glass-shadow); padding: 0; outline: none; cursor: pointer; transform: translateZ(0); 
+        display: flex; align-items: center; justify-content: center;
+        /* 加入 width 过渡，保证拉伸丝滑 */
+        transition: width 0.4s cubic-bezier(0.19, 1, 0.22, 1), transform 0.6s cubic-bezier(0.19, 1, 0.22, 1), border-color 0.4s ease; 
+      }
+      
+      .risk-indicator.panel-open { 
+        transform: translateY(-100px) scale(0.8); pointer-events: none; 
+      }
+      
+      /* 当赋予 risk-active 时，开始拉伸变长，针对 Medium 修改宽度 */
+      .risk-indicator.risk-active {
+        width: 125px;
+      }
+      
+      /* 文字默认状态：无宽度、全透明、无边距 (隐藏在图标后面) */
+      #risk_text {
+        max-width: 0; opacity: 0; overflow: hidden; white-space: nowrap; 
+        font-weight: 800; font-size: 16px; margin-left: 0;
+        transition: max-width 0.4s ease, opacity 0.3s ease, margin-left 0.3s ease, color 0.4s ease;
+      }
+      
+      /* 当赋予 risk-active 时，文字展开显示在图标后面 */
+      .risk-indicator.risk-active #risk_text {
+        max-width: 75px; opacity: 1; margin-left: 6px;
+      }
 
-      .loc-btn { position: fixed; right: 12px; bottom: 100px; z-index: 999997 !important; width: 46px; height: 46px; border-radius: 23px; display: flex; align-items: center; justify-content: center; background: var(--ios-glass-bg) !important; backdrop-filter: var(--ios-glass-blur); -webkit-backdrop-filter: var(--ios-glass-blur); border: var(--ios-glass-border); box-shadow: var(--ios-glass-shadow); cursor: pointer; outline: none; border: none; transition: transform 0.6s cubic-bezier(0.19, 1, 0.22, 1); }
+      /* 具体的颜色状态映射 (边框、图标、文字) */
+      .risk-low { animation: glow-low 2s infinite; border: 1px solid rgba(52,199,89,0.5) !important; }
+      .risk-low .material-symbols-rounded, .risk-low #risk_text { color: #34c759 !important; }
+
+      .risk-medium { animation: glow-medium 1.5s infinite; border: 1px solid rgba(255,204,0,0.5) !important; }
+      .risk-medium .material-symbols-rounded, .risk-medium #risk_text { color: #ffcc00 !important; }
+
+      .risk-high { animation: glow-high 1s infinite; border: 1px solid rgba(255,59,48,0.5) !important; }
+      .risk-high .material-symbols-rounded, .risk-high #risk_text { color: #ff3b30 !important; }
+
+      /* --- 其他底部组件和面板 --- */
+      .fg-bottombar { 
+        position: fixed; bottom: 32px; left: 0; right: 0; z-index: 999998 !important; display: flex; 
+        align-items: center; justify-content: center; gap: 14px; pointer-events: none; 
+        transition: transform 0.6s cubic-bezier(0.19, 1, 0.22, 1); 
+      }
+      .fg-bottombar.panel-open, .fg-bottombar.nav-active { 
+        transform: translateY(150px); pointer-events: none; transition: transform 0.4s cubic-bezier(0.19, 1, 0.22, 1); 
+      }
+
+      .fg-iconbtn, .fg-search-trigger { 
+        pointer-events: auto; background: var(--ios-glass-bg) !important; backdrop-filter: var(--ios-glass-blur); 
+        -webkit-backdrop-filter: var(--ios-glass-blur); border: var(--ios-glass-border); box-shadow: var(--ios-glass-shadow); transform: translateZ(0); 
+      }
+      .fg-iconbtn { 
+        width: 46px; height: 46px; border-radius: 23px; display: flex; align-items: center; justify-content: center; border:none; outline: none;
+      }
+      .fg-search-trigger { 
+        width: 65%; max-width: 320px; height: 46px; border-radius: 23px; display: flex; justify-content: space-between; 
+        align-items: center; padding: 0 16px 0 20px; color: #666; font-size: 16px; font-weight: 500; cursor: pointer; 
+      }
+
+      .loc-btn { 
+        position: fixed; right: 12px; bottom: 100px; z-index: 999997 !important; width: 46px; height: 46px; 
+        border-radius: 23px; display: flex; align-items: center; justify-content: center; 
+        background: var(--ios-glass-bg) !important; backdrop-filter: var(--ios-glass-blur); 
+        -webkit-backdrop-filter: var(--ios-glass-blur); border: var(--ios-glass-border); 
+        box-shadow: var(--ios-glass-shadow); cursor: pointer; outline: none; border: none; transition: transform 0.6s cubic-bezier(0.19, 1, 0.22, 1); 
+      }
       .loc-btn.panel-open { transform: translateX(100px); pointer-events: none; }
 
-      .nav-info-panel { position: fixed; bottom: 32px; left: 16px; right: 16px; max-width: 400px; margin: 0 auto; z-index: 999998 !important; background: var(--ios-glass-bg) !important; backdrop-filter: var(--ios-glass-blur); -webkit-backdrop-filter: var(--ios-glass-blur); border: var(--ios-glass-border); border-radius: 24px; box-shadow: var(--ios-glass-shadow); display: flex; justify-content: space-between; align-items: center; padding: 12px 20px; transform: translateY(150px); pointer-events: none; transition: transform 0.6s cubic-bezier(0.19, 1, 0.22, 1); }
+      .nav-info-panel { 
+        position: fixed; bottom: 32px; left: 16px; right: 16px; max-width: 400px; margin: 0 auto; 
+        z-index: 999998 !important; background: var(--ios-glass-bg) !important; backdrop-filter: var(--ios-glass-blur); 
+        -webkit-backdrop-filter: var(--ios-glass-blur); border: var(--ios-glass-border); border-radius: 24px; 
+        box-shadow: var(--ios-glass-shadow); display: flex; justify-content: space-between; align-items: center; 
+        padding: 12px 20px; transform: translateY(150px); pointer-events: none; transition: transform 0.6s cubic-bezier(0.19, 1, 0.22, 1); 
+      }
       .nav-info-panel.active { transform: translateY(0); pointer-events: auto; }
       
       .nav-text-container { display: flex; align-items: baseline; gap: 8px; }
@@ -296,7 +415,11 @@ ui <- f7Page(
     div(id = "search_suggestions", class = "suggestions-container")
   ),
 
-  tags$button(id = "risk_btn", class = "action-button risk-indicator", tags$span(class = "material-symbols-rounded", "siren_question")),
+  # 【核心修改】：风险按钮加入了包裹文字的 #risk_text 结构
+  tags$button(id = "risk_btn", class = "action-button risk-indicator", 
+    tags$span(class = "material-symbols-rounded", "siren_question"),
+    tags$span(id = "risk_text", "Low")
+  ),
   
   div(id = "nav_info_panel", class = "nav-info-panel",
       div(class = "nav-text-container", tags$span(id = "nav_time", class = "nav-time", "-- min"), tags$span(id = "nav_dist", class = "nav-dist", "-- mi")),

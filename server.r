@@ -44,12 +44,21 @@ server <- function(input, output, session) {
                        fillOpacity = 1, layerId = "current_loc")
   })
 
-  # 【核心修改区：监听点击 -> 移动地图标记 -> 弹窗等待用户确认】
+  # --- 当你在警告页面打开 Traffic Heatmap 开关 ---
+  observeEvent(input$show_heatmap, {
+    if (input$show_heatmap) {
+      # 开启后，按钮拉伸发光，状态变为 Medium 
+      session$sendCustomMessage("update_risk_level", list(level = "Medium"))
+    } else {
+      # 关闭后，完全恢复无光无字圆形状态
+      session$sendCustomMessage("update_risk_level", list(level = "Off"))
+    }
+  })
+
   observeEvent(input$map_click, {
     click <- input$map_click
     req(click)
     
-    # 获取点击位置的地名
     url <- sprintf("https://nominatim.openstreetmap.org/reverse?format=json&lat=%f&lon=%f", click$lat, click$lng)
     req_data <- tryCatch(jsonlite::fromJSON(url), error = function(e) NULL)
     
@@ -59,7 +68,6 @@ server <- function(input, output, session) {
       dest_name <- gsub("'", "", dest_name)
     }
     
-    # 移动地图并打上红色的目的地 Pin
     leafletProxy("map") %>% 
       clearGroup("search_res") %>% 
       setView(lng = click$lng, lat = click$lat, zoom = 15) %>%
@@ -69,13 +77,11 @@ server <- function(input, output, session) {
         label = dest_name, labelOptions = labelOptions(noHide = TRUE, textOnly = TRUE, className = "ios-map-label", direction = "top", offset = c(0, -10))
       )
     
-    # 执行 JS：填入目的地输入框，藏入精确坐标，并打开含有 Directions 按钮的面板
     js_code <- sprintf("
       $('#q_input').val('%s');
       $('#q_input').attr('data-clicked-lat', %f);
       $('#q_input').attr('data-clicked-lon', %f);
       
-      // 滑出 Search / Directions 面板
       $('#search_panel').addClass('active');
       $('#global_overlay').addClass('active');
       $('#bottom_tray').addClass('panel-open');
@@ -134,7 +140,6 @@ server <- function(input, output, session) {
       if (is.null(start_loc)) { start_loc <- current_location; start_name <- "Current Location" }
     }
     
-    # 优先读取 JS 绑定的地图点击精确坐标
     dest_loc <- NULL
     if (!is.null(input$do_custom_route$dest_lat) && !is.null(input$do_custom_route$dest_lon)) {
       dest_loc <- c(lon = as.numeric(input$do_custom_route$dest_lon), lat = as.numeric(input$do_custom_route$dest_lat))
