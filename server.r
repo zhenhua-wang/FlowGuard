@@ -1,83 +1,43 @@
 library(shiny)
 library(shinyMobile)
 library(leaflet)
-
+library(leaflet.extras)
+library(shinyjs)
 server <- function(input, output, session) {
-
-  # ---- Base map (NO zoom +/- buttons) ----
+  
   output$map <- renderLeaflet({
-    leaflet(
-      options = leafletOptions(
-        zoomControl = FALSE,        # removes + / − buttons
-        attributionControl = FALSE
-      )
-    ) %>%
-      addProviderTiles("Esri.WorldStreetMap") %>%
-      setView(lng = -92.36, lat = 38.95, zoom = 12)
+    leaflet(options = leafletOptions(zoomControl = FALSE)) %>%
+      addTiles() %>%
+      setView(lng = -92.3341, lat = 38.9517, zoom = 13)
   })
 
-  # ---- Settings popup ----
-  observeEvent(input$btn_settings, {
-    f7Popup(
-      id = "settings_popup",
-      title = "Settings",
-
-      f7Block(strong = TRUE, "Search Distance"),
-
-      f7Slider(
-        inputId = "search_distance",
-        label = NULL,
-        min = 5,
-        max = 100,
-        value = 20,
-        step = 5
-      ),
-
-      f7BlockFooter("Used to limit nearby search results and alerts.")
-    )
+  observeEvent(input$risk_btn, {
+    shinyjs::addClass("risk_panel", "active")
+    shinyjs::addClass("global_overlay", "active")
+    shinyjs::addClass("risk_btn", "panel-open")
   })
 
-  # ---- Search (geocode + circle) ----
-  observeEvent(input$q, {
-    req(nzchar(trimws(input$q)))
-
-    if (!requireNamespace("tidygeocoder", quietly = TRUE)) {
-      showNotification("Install 'tidygeocoder' to enable search.", type = "warning")
-      return()
-    }
-
-    query <- trimws(input$q)
-
-    res <- tryCatch({
-      tidygeocoder::geocode(
-        data.frame(address = query),
-        address = address,
-        method = "osm",
-        quiet = TRUE
-      )
-    }, error = function(e) NULL)
-
-    if (is.null(res) || anyNA(res$lat) || anyNA(res$long)) {
-      showNotification("No results found.", type = "error")
-      return()
-    }
-
-    lat <- res$lat[1]
-    lon <- res$long[1]
-    dist <- input$search_distance %||% 20
-
-    leafletProxy("map") %>%
-      clearMarkers() %>%
-      clearShapes() %>%
-      setView(lng = lon, lat = lat, zoom = 15) %>%
-      addCircleMarkers(lng = lon, lat = lat, radius = 6) %>%
-      addCircles(
-        lng = lon, lat = lat,
-        radius = dist,
-        fillOpacity = 0.15
-      )
+  observeEvent(input$settings_btn, {
+    shinyjs::addClass("settings_panel", "active")
+    shinyjs::addClass("global_overlay", "active")
+    shinyjs::addClass("bottom_tray", "panel-open")
+    shinyjs::addClass("risk_btn", "panel-open")
   })
 
-  # No overlay panel for now
-  output$panel_ui <- renderUI(NULL)
+  observeEvent(input$search_trigger, {
+    shinyjs::addClass("search_panel", "active")
+    shinyjs::addClass("global_overlay", "active")
+    shinyjs::addClass("bottom_tray", "panel-open")
+    shinyjs::addClass("risk_btn", "panel-open")
+  })
+
+  observeEvent(c(input$close_all, input$c1, input$c2, input$c3), {
+    shinyjs::removeClass("risk_panel", "active")
+    shinyjs::removeClass("settings_panel", "active")
+    shinyjs::removeClass("search_panel", "active")
+    shinyjs::removeClass("global_overlay", "active")
+    
+    shinyjs::removeClass("risk_btn", "panel-open")
+    shinyjs::removeClass("bottom_tray", "panel-open")
+  }, ignoreInit = TRUE)
 }
