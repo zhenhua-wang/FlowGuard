@@ -1,6 +1,3 @@
-# ==========================================
-# server.r - 后端业务逻辑与模型处理
-# ==========================================
 library(shiny)
 library(leaflet)
 library(leaflet.extras)
@@ -14,45 +11,6 @@ library(httr)
 
 source("./lgcp_utils.r")
 
-# ==========================================
-# 辅助服务与计算
-# ==========================================
-geocode_osm <- function(query) {
-  safe_query <- URLencode(query)
-  url <- paste0("https://nominatim.openstreetmap.org/search?q=", safe_query, "&format=json&limit=1&viewbox=-93.0,39.5,-91.5,38.0")
-  req <- tryCatch(jsonlite::fromJSON(url), error = function(e) NULL)
-  if (!is.null(req) && length(req) > 0 && is.data.frame(req) && nrow(req) > 0) {
-    return(c(lon = as.numeric(req$lon[1]), lat = as.numeric(req$lat[1])))
-  }
-  return(NULL)
-}
-
-get_osrm_route <- function(start_pt, end_pt) {
-  url <- sprintf("https://router.project-osrm.org/route/v1/driving/%f,%f;%f,%f?overview=full&geometries=geojson",
-                 start_pt["lon"], start_pt["lat"], end_pt["lon"], end_pt["lat"])
-  req <- tryCatch(jsonlite::fromJSON(url), error = function(e) NULL)
-  if (!is.null(req) && !is.null(req$code) && req$code == "Ok") {
-    coords <- req$routes$geometry$coordinates[[1]]
-    dist_meters <- req$routes$distance[1]
-    time_seconds <- req$routes$duration[1]
-    if(is.matrix(coords) || is.data.frame(coords)){ 
-      return(list(coords = coords, dist = dist_meters, time = time_seconds)) 
-    }
-  }
-  return(NULL)
-}
-
-get_bearing <- function(lon1, lat1, lon2, lat2) {
-  rad <- pi / 180
-  dLon <- (lon2 - lon1) * rad
-  lat1 <- lat1 * rad
-  lat2 <- lat2 * rad
-  y <- sin(dLon) * cos(lat2)
-  x <- cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(dLon)
-  bearing <- atan2(y, x) / rad
-  return((bearing + 360) %% 360)
-}
-
 get_weather <- function(lat, lon) {
   url <- sprintf("https://api.open-meteo.com/v1/forecast?latitude=%f&longitude=%f&current_weather=true", lat, lon)
   res <- tryCatch({
@@ -61,13 +19,11 @@ get_weather <- function(lat, lon) {
       data <- fromJSON(content(req, "text", encoding = "UTF-8"))
       code <- data$current_weather$weathercode
       temp <- data$current_weather$temperature
-      
       desc <- "Clear/Cloudy"
       if (code %in% c(45,48)) desc <- "Fog"
       if (code >= 51 && code <= 67) desc <- "Rain"
       if (code >= 71 && code <= 86) desc <- "Snow"
       if (code >= 95) desc <- "Thunderstorm"
-      
       return(sprintf("%s, %.1f C", desc, temp))
     }
     return("Unknown Weather")
@@ -150,10 +106,43 @@ call_archia_agent <- function(prompt_text) {
   return(res)
 }
 
-# ==========================================
-# 核心 Server 逻辑
-# ==========================================
-server <- function(input, output, session) {
+geocode_osm <- function(query) {
+  safe_query <- URLencode(query)
+  url <- paste0("https://nominatim.openstreetmap.org/search?q=", safe_query, "&format=json&limit=1&viewbox=-93.0,39.5,-91.5,38.0")
+  req <- tryCatch(jsonlite::fromJSON(url), error = function(e) NULL)
+  if (!is.null(req) && length(req) > 0 && is.data.frame(req) && nrow(req) > 0) {
+    return(c(lon = as.numeric(req$lon[1]), lat = as.numeric(req$lat[1])))
+  }
+  return(NULL)
+}
+
+get_osrm_route <- function(start_pt, end_pt) {
+  url <- sprintf("https://router.project-osrm.org/route/v1/driving/%f,%f;%f,%f?overview=full&geometries=geojson",
+                 start_pt["lon"], start_pt["lat"], end_pt["lon"], end_pt["lat"])
+  req <- tryCatch(jsonlite::fromJSON(url), error = function(e) NULL)
+  if (!is.null(req) && !is.null(req$code) && req$code == "Ok") {
+    coords <- req$routes$geometry$coordinates[[1]]
+    dist_meters <- req$routes$distance[1]
+    time_seconds <- req$routes$duration[1]
+    if(is.matrix(coords) || is.data.frame(coords)){ 
+      return(list(coords = coords, dist = dist_meters, time = time_seconds)) 
+    }
+  }
+  return(NULL)
+}
+
+get_bearing <- function(lon1, lat1, lon2, lat2) {
+  rad <- pi / 180
+  dLon <- (lon2 - lon1) * rad
+  lat1 <- lat1 * rad
+  lat2 <- lat2 * rad
+  y <- sin(dLon) * cos(lat2)
+  x <- cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(dLon)
+  bearing <- atan2(y, x) / rad
+  return((bearing + 360) %% 360)
+}
+
+function(input, output, session) {
   
   current_location <- reactiveVal(c(lon = -92.3341, lat = 38.9517))
   current_date <- mdy("1/24/2021") 
@@ -184,9 +173,11 @@ server <- function(input, output, session) {
     leafletProxy("map") %>%
       setView(lng = loc["lon"], lat = loc["lat"], zoom = current_zoom) %>%
       removeMarker(layerId = "current_loc") %>%
+      # 【配置层级】：个人坐标定位球放入 marker_pane，绝对悬浮最高层
       addCircleMarkers(lng = loc["lon"], lat = loc["lat"],
                        radius = 10, color = "#fff", weight = 3, fillColor = "#007AFF",
-                       fillOpacity = 1, layerId = "current_loc")
+                       fillOpacity = 1, layerId = "current_loc",
+                       options = pathOptions(pane = "marker_pane"))
   })
 
   date_lags_rv <- reactive({
@@ -211,10 +202,16 @@ server <- function(input, output, session) {
     loc <- isolate(current_location())
     leaflet(options = leafletOptions(zoomControl = FALSE)) %>%
       addTiles() %>%
+      # 【核心机制】：创建4个具有严格 z-index 层级的自定义面板，数字越大越在上方
+      addMapPane("risk_pane", zIndex = 410) %>%
+      addMapPane("traffic_pane", zIndex = 420) %>%
+      addMapPane("route_pane", zIndex = 430) %>%
+      addMapPane("marker_pane", zIndex = 440) %>%
       setView(lng = loc["lon"], lat = loc["lat"], zoom = 14) %>%
       addCircleMarkers(lng = loc["lon"], lat = loc["lat"], 
                        radius = 10, color = "#fff", weight = 3, fillColor = "#007AFF", 
-                       fillOpacity = 1, layerId = "current_loc")
+                       fillOpacity = 1, layerId = "current_loc",
+                       options = pathOptions(pane = "marker_pane"))
   })
 
   observeEvent(list(input$individual_case, dat_rv()), {
@@ -223,7 +220,9 @@ server <- function(input, output, session) {
       req(dat_rv())
       pts_ll <- st_transform(st_as_sf(dat_rv(), coords = c("x", "y"), crs = model_crs), 4326)
       map_proxy %>% clearGroup("traffic_events") %>%
-        addCircleMarkers(data = pts_ll, group = "traffic_events", radius = 3.5, stroke = FALSE, fillOpacity = 0.6, fillColor = col_red)
+        addCircleMarkers(data = pts_ll, group = "traffic_events", radius = 3.5, stroke = FALSE, 
+                         fillOpacity = 0.6, fillColor = col_red,
+                         options = pathOptions(pane = "traffic_pane"))
     } else {
       map_proxy %>% clearGroup("traffic_events")
     }
@@ -243,7 +242,9 @@ server <- function(input, output, session) {
     }
     
     leafletProxy("map") %>% clearGroup("search_res") %>% setView(lng = click$lng, lat = click$lat, zoom = 15) %>%
-      addCircleMarkers(lng = click$lng, lat = click$lat, group = "search_res", radius = 10, color = "#fff", weight = 3, fillColor = "#FF3B30", fillOpacity = 1, label = dest_name, labelOptions = labelOptions(noHide = TRUE, textOnly = TRUE, className = "ios-map-label", direction = "top", offset = c(0, -10)))
+      addCircleMarkers(lng = click$lng, lat = click$lat, group = "search_res", radius = 10, color = "#fff", weight = 3, fillColor = "#FF3B30", 
+                       fillOpacity = 1, label = dest_name, labelOptions = labelOptions(noHide = TRUE, textOnly = TRUE, className = "ios-map-label", direction = "top", offset = c(0, -10)),
+                       options = pathOptions(pane = "marker_pane"))
     
     js_code <- sprintf("$('#q_input').val('%s'); $('#q_input').attr('data-clicked-lat', %f); $('#q_input').attr('data-clicked-lon', %f); $('#search_panel').addClass('active'); $('#global_overlay').addClass('active'); $('#bottom_tray').addClass('panel-open'); $('#risk_btn').addClass('panel-open'); $('#view_capsule').addClass('panel-open');", dest_name, click$lat, click$lng)
     shinyjs::runjs(js_code)
@@ -304,7 +305,7 @@ server <- function(input, output, session) {
     lon <- as.numeric(input$fly_to_loc$lon); lat <- as.numeric(input$fly_to_loc$lat)
     name <- input$fly_to_loc$name; is_dest <- input$fly_to_loc$type == "q_input"
     fill_color <- ifelse(is_dest, "#FF3B30", "#007AFF") 
-    leafletProxy("map") %>% clearGroup("search_res") %>% addCircleMarkers(lng = lon, lat = lat, group = "search_res", radius = 10, color = "#fff", weight = 3, fillColor = fill_color, fillOpacity = 1, label = name, labelOptions = labelOptions(noHide = TRUE, textOnly = TRUE, className = "ios-map-label", direction = "top", offset = c(0, -10))) %>% setView(lng = lon, lat = lat, zoom = 15)
+    leafletProxy("map") %>% clearGroup("search_res") %>% addCircleMarkers(lng = lon, lat = lat, group = "search_res", radius = 10, color = "#fff", weight = 3, fillColor = fill_color, fillOpacity = 1, label = name, labelOptions = labelOptions(noHide = TRUE, textOnly = TRUE, className = "ios-map-label", direction = "top", offset = c(0, -10)), options = pathOptions(pane = "marker_pane")) %>% setView(lng = lon, lat = lat, zoom = 15)
   })
   
   observeEvent(input$do_custom_route, {
@@ -331,10 +332,10 @@ server <- function(input, output, session) {
     route_data <- get_osrm_route(start_loc, dest_loc)
     map_proxy <- leafletProxy("map") %>% clearGroup("search_res") %>% clearGroup("risk_halos")
     
-    map_proxy %>% addCircleMarkers(lng = dest_loc["lon"], lat = dest_loc["lat"], group = "search_res", radius = 10, color = "#fff", weight = 3, fillColor = "#FF3B30", fillOpacity = 1, label = end_str, labelOptions = labelOptions(noHide = TRUE, textOnly = TRUE, className = "ios-map-label", direction = "top", offset = c(0, -10)))
+    map_proxy %>% addCircleMarkers(lng = dest_loc["lon"], lat = dest_loc["lat"], group = "search_res", radius = 10, color = "#fff", weight = 3, fillColor = "#FF3B30", fillOpacity = 1, label = end_str, labelOptions = labelOptions(noHide = TRUE, textOnly = TRUE, className = "ios-map-label", direction = "top", offset = c(0, -10)), options = pathOptions(pane = "marker_pane"))
     
     if (!identical(start_loc, current_location())) { 
-      map_proxy %>% addCircleMarkers(lng = start_loc["lon"], lat = start_loc["lat"], group = "search_res", radius = 10, color = "#fff", weight = 3, fillColor = "#007AFF", fillOpacity = 1, label = start_name, labelOptions = labelOptions(noHide = TRUE, textOnly = TRUE, className = "ios-map-label", direction = "top", offset = c(0, -10))) 
+      map_proxy %>% addCircleMarkers(lng = start_loc["lon"], lat = start_loc["lat"], group = "search_res", radius = 10, color = "#fff", weight = 3, fillColor = "#007AFF", fillOpacity = 1, label = start_name, labelOptions = labelOptions(noHide = TRUE, textOnly = TRUE, className = "ios-map-label", direction = "top", offset = c(0, -10)), options = pathOptions(pane = "marker_pane")) 
     }
     
     if (!is.null(route_data)) {
@@ -355,8 +356,9 @@ server <- function(input, output, session) {
       )
       route_bounds(bnd)
       
+      # 【配置层级】：将路线放在 route_pane 里面 (夹在光晕上方和定位点下方)
       map_proxy %>% 
-        addPolylines(lng = coords[,1], lat = coords[,2], color = "#007AFF", weight = 6, opacity = 0.8, group = "search_res") %>%
+        addPolylines(lng = coords[,1], lat = coords[,2], color = "#007AFF", weight = 6, opacity = 0.8, group = "search_res", options = pathOptions(pane = "route_pane")) %>%
         setView(lng = start_loc["lon"], lat = start_loc["lat"], zoom = 18)
       
       session$sendCustomMessage("start_nav_ui", list(dist = round(route_data$dist / 1609.34, 1), time = max(1, round(route_data$time / 60))))
@@ -383,7 +385,7 @@ server <- function(input, output, session) {
     
     req(pp_rv())
     map_proxy <- leafletProxy("map")
-    session$sendCustomMessage("update_ai_advice", list(text = "TraffIQ is analyzing environment context..."))
+    session$sendCustomMessage("update_ai_advice", list(text = "Archia is analyzing environment context..."))
     
     loc <- current_location()
     curr_pt <- st_sfc(st_point(c(loc["lon"], loc["lat"])), crs=4326) %>% st_transform(model_crs)
@@ -446,9 +448,11 @@ server <- function(input, output, session) {
     radii_curr <- seq(buffer_radius, 1, length.out = n_fade_rings)
     alpha_step_curr <- 1.5 / n_fade_rings 
     for (j in seq_len(n_fade_rings)) {
+      # 【配置层级】：把当前位置的发光热力圈锁在 risk_pane 最底层
       map_proxy %>% addCircles(
         lng = loc["lon"], lat = loc["lat"], radius = radii_curr[j], group = "current_risk_halo", 
-        stroke = FALSE, fill = TRUE, fillColor = curr_color, fillOpacity = alpha_step_curr, options = pathOptions(clickable = FALSE)
+        stroke = FALSE, fill = TRUE, fillColor = curr_color, fillOpacity = alpha_step_curr, 
+        options = pathOptions(clickable = FALSE, pane = "risk_pane")
       )
     }
 
@@ -482,13 +486,14 @@ server <- function(input, output, session) {
           alpha_step_route <- 1.2 / n_fade_rings  
           
           for (j in seq_len(n_fade_rings)) {
+            # 【配置层级】：把整条路线的发光热力圈也锁在 risk_pane 最底层
             map_proxy %>% addCircles(
               lng = risk_data$lng, lat = risk_data$lat, 
               radius = radii_route[j], group = "risk_halos", 
               stroke = FALSE, fill = TRUE, 
               fillColor = risk_data$color, 
               fillOpacity = alpha_step_route, 
-              options = pathOptions(clickable = FALSE)
+              options = pathOptions(clickable = FALSE, pane = "risk_pane")
             )
           }
         }
