@@ -1,6 +1,3 @@
-# ==========================================
-# server.R - 后端业务逻辑与模型处理
-# ==========================================
 library(shiny)
 library(leaflet)
 library(leaflet.extras)
@@ -14,9 +11,6 @@ library(httr)
 
 source("./lgcp_utils.r")
 
-# ==========================================
-# 辅助服务与计算
-# ==========================================
 get_weather <- function(lat, lon) {
   url <- sprintf("https://api.open-meteo.com/v1/forecast?latitude=%f&longitude=%f&current_weather=true", lat, lon)
   res <- tryCatch({
@@ -79,6 +73,7 @@ call_archia_agent <- function(prompt_text) {
     resp_text <- content(req, "text", encoding = "UTF-8")
     
     if (status_code(req) != 200) {
+       print(paste("Archia HTTP Error:", status_code(req)))
        return("Risk: Unknown\nSpeed: N/A\nSuggestion: API Server Error.")
     }
     
@@ -86,6 +81,8 @@ call_archia_agent <- function(prompt_text) {
     
     if (!is.null(data$status)) {
        if (data$status == "failed") {
+           err_msg <- if(!is.null(data$error$message)) data$error$message else "Unknown error"
+           print(paste("Archia Returned Failed Status:", err_msg))
            return("Risk: Unknown\nSpeed: N/A\nSuggestion: Agent processing failed.")
        } else if (data$status != "completed") {
            return("Risk: Unknown\nSpeed: N/A\nSuggestion: Agent status not completed.")
@@ -147,10 +144,8 @@ get_bearing <- function(lon1, lat1, lon2, lat2) {
   return((bearing + 360) %% 360)
 }
 
-# ==========================================
-# 核心 Server 逻辑
-# ==========================================
-function(input, output, session) {
+# 【修复报错的关键】：显式定义 server 变量
+server <- function(input, output, session) {
   
   current_location <- reactiveVal(c(lon = -92.3341, lat = 38.9517))
   current_date <- mdy("1/24/2021") 
@@ -173,11 +168,9 @@ function(input, output, session) {
   
   first_loc_fixed <- reactiveVal(FALSE)
   
-  # 状态缓存器
   last_agent_eval_state <- reactiveVal(list(
       tier = "", 
       tolerance = "", 
-      road_info = "",  
       parsed_level = "Low",
       thresh_med = 1.0e-07,
       thresh_high = 1.0e-06
@@ -188,12 +181,13 @@ function(input, output, session) {
     loc <- c(lon = as.numeric(input$user_location$lon), lat = as.numeric(input$user_location$lat))
     current_location(loc)
     
-    map_proxy <- leafletProxy("map") %>%
-      removeMarker(layerId = "current_loc") %>%
+    map_proxy <- leafletProxy("map") 
+    
+    map_proxy %>%
       addCircleMarkers(lng = loc["lon"], lat = loc["lat"],
                        radius = 10, color = "#fff", weight = 3, fillColor = "#007AFF",
                        fillOpacity = 1, layerId = "current_loc",
-                       options = pathOptions(pane = "marker_pane"))
+                       options = pathOptions(pane = "marker_pane", className = "smooth-loc-marker"))
                        
     if (!first_loc_fixed()) {
       map_proxy %>% setView(lng = loc["lon"], lat = loc["lat"], zoom = 15)
@@ -225,15 +219,16 @@ function(input, output, session) {
     loc <- isolate(current_location())
     leaflet(options = leafletOptions(zoomControl = FALSE)) %>%
       addTiles() %>%
-      addMapPane("risk_pane", zIndex = 410) %>%
-      addMapPane("traffic_pane", zIndex = 420) %>%
-      addMapPane("route_pane", zIndex = 430) %>%
+      # 初始化时，我们将路线放在风险之下 (410 < 420)
+      addMapPane("route_pane", zIndex = 410) %>%
+      addMapPane("risk_pane", zIndex = 420) %>%
+      addMapPane("traffic_pane", zIndex = 430) %>%
       addMapPane("marker_pane", zIndex = 440) %>%
       setView(lng = loc["lon"], lat = loc["lat"], zoom = 14) %>%
       addCircleMarkers(lng = loc["lon"], lat = loc["lat"], 
                        radius = 10, color = "#fff", weight = 3, fillColor = "#007AFF", 
                        fillOpacity = 1, layerId = "current_loc",
-                       options = pathOptions(pane = "marker_pane"))
+                       options = pathOptions(pane = "marker_pane", className = "smooth-loc-marker"))
   })
 
   observeEvent(list(input$individual_case, dat_rv()), {
@@ -403,40 +398,24 @@ function(input, output, session) {
     }
   })
 
-  # 【绝对统一与防污染架构核心】
-  observeEvent(list(input$show_heatmap, current_route_sf(), pp_rv(), current_location(), input$risk), {
+  observeEvent(list(input$show_heatmap, pp_rv(), current_location(), input$risk), {
     
     if (is.null(input$show_heatmap) || !input$show_heatmap) {
       session$sendCustomMessage("update_risk_level", list(level = "Off"))
       session$sendCustomMessage("update_ai_advice", list(text = "Please turn on 'Risk Spot' or start navigation to view AI suggestions."))
-      leafletProxy("map") %>% clearGroup("risk_halos") %>% clearGroup("current_risk_halo")
+      leafletProxy("map") %>% clearGroup("current_risk_halo")
       
-      last_agent_eval_state(list(tier = "", road_info = "", tolerance = "", parsed_level = "Low", thresh_med = 1.0e-07, thresh_high = 1.0e-06))
+      last_agent_eval_state(list(tier = "", tolerance = "", parsed_level = "Low", thresh_med = 1.0e-07, thresh_high = 1.0e-06))
       return()
     }
     
     req(pp_rv())
     map_proxy <- leafletProxy("map")
-    
     loc <- current_location()
     curr_pt <- st_sfc(st_point(c(loc["lon"], loc["lat"])), crs=4326) %>% st_transform(model_crs)
-    road_m <- current_route_sf()
     
-    if (is_navigating() && !is.null(road_m)) {
-      bb_route <- st_bbox(st_buffer(road_m, dist = buffer_radius + 10))
-      bb_curr <- st_bbox(st_buffer(curr_pt, 500))
-      bb <- c(xmin = min(bb_route["xmin"], bb_curr["xmin"]), ymin = min(bb_route["ymin"], bb_curr["ymin"]), xmax = max(bb_route["xmax"], bb_curr["xmax"]), ymax = max(bb_route["ymax"], bb_curr["ymax"]))
-    } else {
-      bb <- st_bbox(st_buffer(curr_pt, 500))
-    }
-    
-    # 【核心修复：动态分辨率引擎】强制锁定物理分辨率，消除长途导航导致的光晕摊平 Bug
-    dx <- as.numeric(bb["xmax"] - bb["xmin"])
-    dy <- as.numeric(bb["ymax"] - bb["ymin"])
-    dynamic_npred <- as.integer(max(dx, dy) / 5) # 强行锁定 5 米/格精度
-    dynamic_npred <- max(200, min(dynamic_npred, 600)) # 限制上限防止内存崩溃
-    
-    pred <- predict_lgcp(pp_rv(), xmin = as.numeric(bb["xmin"]), xmax = as.numeric(bb["xmax"]), ymin = as.numeric(bb["ymin"]), ymax = as.numeric(bb["ymax"]), npred = dynamic_npred)
+    bb_curr <- st_bbox(st_buffer(curr_pt, 500))
+    pred <- predict_lgcp(pp_rv(), xmin = as.numeric(bb_curr["xmin"]), xmax = as.numeric(bb_curr["xmax"]), ymin = as.numeric(bb_curr["ymin"]), ymax = as.numeric(bb_curr["ymax"]), npred = 50)
     r_m <- terra::rast(pred[, c("x", "y", "p")], type = "xyz")
     terra::crs(r_m) <- model_crs$wkt
     
@@ -447,26 +426,6 @@ function(input, output, session) {
        if (!is.na(val)) curr_raw_val <- val
     }
     
-    valid_route_raw <- numeric(0)
-    route_coords <- NULL
-    
-    if (is_navigating() && !is.null(road_m)) {
-      sample_pts_m <- tryCatch({ st_line_sample(road_m, density = 1/30) }, error = function(e) NULL)
-      if (!is.null(sample_pts_m) && length(sample_pts_m) > 0) {
-        sample_pts_sf <- st_as_sf(st_cast(sample_pts_m, "POINT"))
-        extracted_raw <- terra::extract(r_m, terra::vect(sample_pts_sf))[,2]
-        
-        valid_idx <- !is.na(extracted_raw)
-        valid_route_raw <- extracted_raw[valid_idx]
-        
-        if (length(valid_route_raw) > 0) {
-          valid_pts_sf <- sample_pts_sf[valid_idx, ]
-          pts_ll <- st_transform(valid_pts_sf, 4326)
-          route_coords <- st_coordinates(pts_ll)
-        }
-      }
-    }
-    
     user_risk_tolerance <- if (is.null(input$risk)) "Moderate" else input$risk
     old_state <- last_agent_eval_state()
     
@@ -474,28 +433,26 @@ function(input, output, session) {
     dyn_thresh_high <- if(!is.null(old_state$thresh_high)) old_state$thresh_high else 1.0e-06
     
     current_tier <- "Low"
-    if (curr_raw_val >= dyn_thresh_high) current_tier <- "High"
-    else if (curr_raw_val >= dyn_thresh_med) current_tier <- "Medium"
+    if (curr_raw_val >= dyn_thresh_high) {
+        current_tier <- "High"
+    } else if (curr_raw_val >= dyn_thresh_med) {
+        current_tier <- "Medium"
+    }
     
-    current_time_str <- format(Sys.time(), "%I:%M %p")
-    weather_cond <- get_weather(loc["lat"], loc["lon"])
-    road_info <- get_road_info(loc["lat"], loc["lon"])
-    
-    # 状态拦截：只有自身层级、限速道路、用户容忍度发生变化才会发请求
-    state_changed <- (old_state$tier != current_tier) || 
-                     (old_state$tolerance != user_risk_tolerance) ||
-                     (old_state$road_info != road_info)
-    
+    state_changed <- (old_state$tier != current_tier) || (old_state$tolerance != user_risk_tolerance)
     parsed_level <- old_state$parsed_level 
     
     if (state_changed) {
-      # 【核心修复：分离式提示结构】防止 AI 根据局部位置乱调标准
+      current_time_str <- format(Sys.time(), "%I:%M %p")
+      weather_cond <- get_weather(loc["lat"], loc["lon"])
+      road_info <- get_road_info(loc["lat"], loc["lon"])
+      
       agent_input <- sprintf(
-        "GLOBAL CONTEXT:\n- User Risk Tolerance: %s\n- Current Time: %s\n- Weather: %s\n\nLOCAL CONTEXT:\n- Current Location Score: %e\n- %s",
-        user_risk_tolerance, current_time_str, weather_cond, curr_raw_val, road_info
+        "Real-time INPUT CONTEXT:\n- Raw Spatial Risk Score: %e\n- User Risk Tolerance: %s\n- Location: [%f, %f]\n- Current Time: %s\n- Weather: %s\n- %s",
+        curr_raw_val, user_risk_tolerance, loc["lat"], loc["lon"], current_time_str, weather_cond, road_info
       )
       
-      session$sendCustomMessage("update_ai_advice", list(text = "TraffIQ is evaluating route safety..."))
+      session$sendCustomMessage("update_ai_advice", list(text = "TraffIQ is analyzing environment context..."))
       
       ai_response <- call_archia_agent(agent_input)
       
@@ -504,22 +461,14 @@ function(input, output, session) {
       }
       ai_response <- paste(ai_response, collapse = "\n")
       
-      tryCatch({
-        if (grepl("Thresholds?:", ai_response, ignore.case=TRUE)) {
-           thresh_line <- grep("Thresholds?:", strsplit(ai_response, "\n")[[1]], value=TRUE, ignore.case=TRUE)[1]
-           if (!is.na(thresh_line)) {
-               nums <- regmatches(thresh_line, gregexpr("[0-9]+\\.?[0-9]*e[-+][0-9]+|[0-9]+\\.?[0-9]*", thresh_line, ignore.case=TRUE))[[1]]
-               if (length(nums) >= 2) {
-                  t1 <- as.numeric(nums[1])
-                  t2 <- as.numeric(nums[2])
-                  if (!is.na(t1) && !is.na(t2) && t1 > 0 && t2 > 0) {
-                     dyn_thresh_med <- min(t1, t2)
-                     dyn_thresh_high <- max(t1, t2)
-                  }
-               }
-           }
-        }
-      }, error = function(e) {})
+      if (grepl("Thresholds:", ai_response, ignore.case=TRUE)) {
+         thresh_line <- grep("Thresholds:", strsplit(ai_response, "\n")[[1]], value=TRUE, ignore.case=TRUE)[1]
+         nums <- regmatches(thresh_line, gregexpr("[0-9]+\\.?[0-9]*e[-+][0-9]+|[0-9]+\\.?[0-9]*", thresh_line, ignore.case=TRUE))[[1]]
+         if (length(nums) >= 2) {
+            dyn_thresh_med <- as.numeric(nums[1])
+            dyn_thresh_high <- as.numeric(nums[2])
+         }
+      }
       
       current_tier <- "Low"
       if (curr_raw_val >= dyn_thresh_high) current_tier <- "High"
@@ -533,45 +482,79 @@ function(input, output, session) {
       ui_text <- gsub("\\*\\*(?i)Suggestion:\\*\\*|(?i)Suggestion:|\\*\\*(?i)Advice:\\*\\*|(?i)Advice:", "<b>Suggestion:</b>", ui_text)
       ui_text <- gsub("\\n", "<br/>", ui_text)
       
-      parsed_level <- current_tier
-      
       session$sendCustomMessage("update_ai_advice", list(text = ui_text))
-      session$sendCustomMessage("update_risk_level", list(level = parsed_level))
+      session$sendCustomMessage("update_risk_level", list(level = current_tier))
+      
+      parsed_level <- current_tier
       
       last_agent_eval_state(list(
           tier = current_tier, 
-          road_info = road_info,
           tolerance = user_risk_tolerance, 
-          parsed_level = parsed_level,
+          parsed_level = current_tier,
           thresh_med = dyn_thresh_med,
           thresh_high = dyn_thresh_high
       ))
     }
     
     curr_color <- if (parsed_level == "High") col_red else if (parsed_level == "Medium") col_yellow else col_green
-    
-    map_proxy %>% clearGroup("current_risk_halo")
     radii_curr <- seq(buffer_radius, 1, length.out = n_fade_rings)
     alpha_step_curr <- 1.5 / n_fade_rings 
     for (j in seq_len(n_fade_rings)) {
       map_proxy %>% addCircles(
-        lng = loc["lon"], lat = loc["lat"], radius = radii_curr[j], group = "current_risk_halo", 
-        stroke = FALSE, fill = TRUE, fillColor = curr_color, fillOpacity = alpha_step_curr, options = pathOptions(clickable = FALSE, pane = "risk_pane")
+        lng = loc["lon"], lat = loc["lat"], radius = radii_curr[j], 
+        layerId = paste0("curr_halo_", j), 
+        group = "current_risk_halo", 
+        stroke = FALSE, fill = TRUE, fillColor = curr_color, fillOpacity = alpha_step_curr, 
+        options = pathOptions(clickable = FALSE, pane = "risk_pane", className = "smooth-halo")
       )
     }
+  }, ignoreInit = TRUE)
 
-    map_proxy %>% clearGroup("risk_halos")
-    if (is_navigating() && !is.null(route_coords) && length(valid_route_raw) > 0) {
-       risk_data <- data.frame(lng = route_coords[, 1], lat = route_coords[, 2], raw_val = valid_route_raw) %>% 
+  observeEvent(list(input$show_heatmap, current_route_sf(), pp_rv(), input$risk), {
+    
+    map_proxy <- leafletProxy("map")
+    
+    if (is.null(input$show_heatmap) || !input$show_heatmap) {
+      map_proxy %>% clearGroup("risk_halos")
+      return()
+    }
+    req(pp_rv())
+
+    if (is_navigating() && !is.null(current_route_sf())) {
+      map_proxy %>% clearGroup("risk_halos")
+      
+      road_m <- current_route_sf()
+      bb_route <- st_bbox(st_buffer(road_m, dist = buffer_radius + 10))
+      
+      pred <- predict_lgcp(pp_rv(), xmin = as.numeric(bb_route["xmin"]), xmax = as.numeric(bb_route["xmax"]), ymin = as.numeric(bb_route["ymin"]), ymax = as.numeric(bb_route["ymax"]), npred = 200)
+      r_m <- terra::rast(pred[, c("x", "y", "p")], type = "xyz")
+      terra::crs(r_m) <- model_crs$wkt
+      
+      sample_pts_m <- tryCatch({ st_line_sample(road_m, density = 1/30) }, error = function(e) NULL)
+      
+      if (!is.null(sample_pts_m) && length(sample_pts_m) > 0) {
+        sample_pts_sf <- st_as_sf(st_cast(sample_pts_m, "POINT"))
+        extracted_raw <- terra::extract(r_m, terra::vect(sample_pts_sf))[,2]
+        
+        valid_raw <- extracted_raw[!is.na(extracted_raw)]
+        if (length(valid_raw) > 0) {
+          pts_ll <- st_transform(sample_pts_sf, 4326)
+          coords <- st_coordinates(pts_ll)
+          
+          old_state <- last_agent_eval_state()
+          dyn_thresh_med <- if(!is.null(old_state$thresh_med)) old_state$thresh_med else 1.0e-07
+          dyn_thresh_high <- if(!is.null(old_state$thresh_high)) old_state$thresh_high else 1.0e-06
+          
+          risk_data <- data.frame(lng = coords[, 1], lat = coords[, 2], raw_val = extracted_raw) %>% 
             filter(!is.na(raw_val) & raw_val >= dyn_thresh_med) %>%
             mutate(color = ifelse(raw_val >= dyn_thresh_high, col_red, col_yellow))
 
-       route_buffer_radius <- buffer_radius * 0.75  
-       radii_route <- seq(route_buffer_radius, 1, length.out = n_fade_rings)
-       alpha_step_route <- 1.2 / n_fade_rings  
+          route_buffer_radius <- buffer_radius * 0.75  
+          radii_route <- seq(route_buffer_radius, 1, length.out = n_fade_rings)
+          alpha_step_route <- 1.2 / n_fade_rings  
           
-       if (nrow(risk_data) > 0) {
-           for (j in seq_len(n_fade_rings)) {
+          if (nrow(risk_data) > 0) {
+            for (j in seq_len(n_fade_rings)) {
               map_proxy %>% addCircles(
                 lng = risk_data$lng, lat = risk_data$lat, 
                 radius = radii_route[j], group = "risk_halos", 
@@ -580,8 +563,13 @@ function(input, output, session) {
                 fillOpacity = alpha_step_route, 
                 options = pathOptions(clickable = FALSE, pane = "risk_pane")
               )
-           }
-       }
+            }
+          }
+        }
+      }
+    } else {
+       map_proxy %>% clearGroup("risk_halos")
     }
   }, ignoreInit = TRUE)
+
 }

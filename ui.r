@@ -34,17 +34,12 @@ f7Page(
         Shiny.setInputValue('fly_to_loc', {lat: lat, lon: lon, name: shortName, type: activeInputId, rand: Math.random()});
       }
       
-      // 【核心修改】：通过纯 JS 收起面板，不触发 R 后端的 close_all，保证终点不会被清空
       function triggerCustomRoute() {
         let start_val = $('#start_input').val().trim(); let end_val = $('#q_input').val().trim();
         let click_lat = $('#q_input').attr('data-clicked-lat'); let click_lon = $('#q_input').attr('data-clicked-lon');
         if(end_val === '') { alert('Please enter a destination.'); return; }
         
-        // 直接操作 DOM 隐藏所有面板
-        $('.ios-panel, #global_overlay').removeClass('active');
-        $('.fg-bottombar, .loc-btn, .risk-indicator, .view-capsule').removeClass('panel-open');
-        setTimeout(hideSubViews, 300);
-        
+        Shiny.setInputValue('close_all', Math.random());
         Shiny.setInputValue('do_custom_route', {
           start: start_val, end: end_val, dest_lat: click_lat ? parseFloat(click_lat) : null, dest_lon: click_lon ? parseFloat(click_lon) : null, rand: Math.random()
         });
@@ -80,7 +75,6 @@ f7Page(
         if (\"geolocation\" in navigator) {
           navigator.geolocation.getCurrentPosition(function(position) {
             Shiny.setInputValue(\"user_location\", { lat: position.coords.latitude, lon: position.coords.longitude, rand: Math.random() });
-            showToast(\"Location updated.\");
             lastLocTime = Date.now(); 
           }, function(error) {
             showToast(\"Failed to get location. Please allow GPS.\");
@@ -141,6 +135,12 @@ f7Page(
              mapEl.css('transform', 'translate(-50%, -50%) rotate(0deg)');
              $('#toggle_view_icon').text('explore'); 
              
+             // 【核心动态层级】：全局模式下，将路线面板的 Z-index 降到 405 (沉在风险图层 410 之下)
+             try {
+                 let mapObj = HTMLWidgets.getInstance(document.getElementById('map')).getMap();
+                 mapObj.getPane('route_pane').style.zIndex = 405; 
+             } catch(e) {}
+             
              let count = 0;
              let interval = setInterval(function() { window.dispatchEvent(new Event('resize')); count++; if(count > 10) clearInterval(interval); }, 50);
              
@@ -166,6 +166,12 @@ f7Page(
              mapEl.css('transform', 'translate(-50%, -50%) rotate(' + msg.deg + 'deg)');
              $('#toggle_view_icon').text('route'); 
              
+             // 【核心动态层级】：第一视角模式下，将路线面板的 Z-index 提至 430 (悬浮在风险图层 410 之上)
+             try {
+                 let mapObj = HTMLWidgets.getInstance(document.getElementById('map')).getMap();
+                 mapObj.getPane('route_pane').style.zIndex = 430; 
+             } catch(e) {}
+             
              let count = 0;
              let interval = setInterval(function() { window.dispatchEvent(new Event('resize')); count++; if(count > 10) clearInterval(interval); }, 50);
          }
@@ -186,6 +192,10 @@ f7Page(
 
     tags$style(HTML("
       body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; overflow: hidden; }
+      
+      path.smooth-loc-marker, path.smooth-halo {
+        transition: d 2.5s cubic-bezier(0.25, 1, 0.5, 1), fill 0.5s ease, fill-opacity 0.5s ease !important;
+      }
       
       #fg-map { 
         position: fixed; top: 50%; left: 50%; width: 100vw; height: 100vh; 
