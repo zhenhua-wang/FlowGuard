@@ -1,5 +1,7 @@
+# ==========================================
+# server.r - 后端业务逻辑与模型处理
+# ==========================================
 library(shiny)
-library(shinyMobile)
 library(leaflet)
 library(leaflet.extras)
 library(shinyjs)
@@ -10,126 +12,10 @@ library(lubridate)
 library(dplyr)
 library(httr) 
 
-# 导入底层模型与风险计算工具
 source("./lgcp_utils.r")
 
-# 1.1 获取实时天气 
-get_weather <- function(lat, lon) {
-  url <- sprintf("https://api.open-meteo.com/v1/forecast?latitude=%f&longitude=%f&current_weather=true", lat, lon)
-  res <- tryCatch({
-    req <- GET(url, timeout(3))
-    if (status_code(req) == 200) {
-      data <- fromJSON(content(req, "text", encoding = "UTF-8"))
-      code <- data$current_weather$weathercode
-      temp <- data$current_weather$temperature
-      
-      desc <- "Clear/Cloudy"
-      if (code %in% c(45,48)) desc <- "Fog"
-      if (code >= 51 && code <= 67) desc <- "Rain"
-      if (code >= 71 && code <= 86) desc <- "Snow"
-      if (code >= 95) desc <- "Thunderstorm"
-      
-      return(sprintf("%s, %.1f C", desc, temp))
-    }
-    return("Unknown Weather")
-  }, error = function(e) { return("Unknown Weather") })
-  return(res)
-}
-
-# 1.2 获取道路信息与限速 
-get_road_info <- function(lat, lon) {
-  url <- paste0("https://overpass-api.de/api/interpreter?data=[out:json];way(around:30,", lat, ",", lon, ")[\"highway\"];out tags;")
-  res <- tryCatch({
-    req <- GET(url, timeout(3))
-    if (status_code(req) == 200) {
-      data <- fromJSON(content(req, "text", encoding = "UTF-8"))
-      if (length(data$elements) > 0 && "tags" %in% names(data$elements)) {
-        tags <- data$elements$tags
-        maxspeed <- if ("maxspeed" %in% names(tags)) tags$maxspeed[1] else "Unknown"
-        road_name <- if ("name" %in% names(tags)) tags$name[1] else "Local Road"
-        return(sprintf("Road: %s, Speed Limit: %s", road_name, maxspeed))
-      }
-    }
-    return("Road Info: Unknown")
-  }, error = function(e) { return("Road Info: Unknown") })
-  return(res)
-}
-
-# 1.3 调用 Archia Agent 进行大模型推理
-call_archia_agent <- function(prompt_text) {
-  
-  # 用户专属 API 配置 
-  archia_api_key <- "ask_6aHeqetNVu285mInrck-QgybeJK14AcZGOQNlSlZ7XE=" 
-  archia_endpoint <- "https://registry.archia.app/v1/responses" 
-  agent_name <- "TrafficCopilot" 
-  
-  res <- tryCatch({
-    # 发起请求
-    req <- POST(
-      url = archia_endpoint,
-      add_headers(
-        Authorization = paste("Bearer", archia_api_key), 
-        `Content-Type` = "application/json"
-      ),
-      body = toJSON(list(
-        model = paste0("agent:", agent_name),
-        input = prompt_text
-      ), auto_unbox = TRUE),
-      timeout(8) # 增加超时时间，防止模型推理较慢
-    )
-    
-    resp_text <- content(req, "text", encoding = "UTF-8")
-    
-    # 1. HTTP 状态码校验
-    if (status_code(req) != 200) {
-       print(paste("Archia HTTP Error:", status_code(req)))
-       print(resp_text)
-       return("Risk: Unknown\nSpeed: N/A\nSuggestion: API Server Error.")
-    }
-    
-    data <- fromJSON(resp_text)
-    
-    # 2. Archia 专属 Payload 状态校验
-    if (!is.null(data$status)) {
-       if (data$status == "failed") {
-           err_msg <- if(!is.null(data$error$message)) data$error$message else "Unknown error"
-           print(paste("Archia Returned Failed Status:", err_msg))
-           return("Risk: Unknown\nSpeed: N/A\nSuggestion: Agent processing failed.")
-       } else if (data$status != "completed") {
-           print(paste("Archia Returned Unexpected Status:", data$status))
-           return("Risk: Unknown\nSpeed: N/A\nSuggestion: Agent status not completed.")
-       }
-    }
-    
-    # 3. 提取输出文本 (应对 jsonlite 解析的不同结构嵌套)
-    out_str <- NULL
-    if (!is.null(data$output)) {
-       if (is.data.frame(data$output) && length(data$output$content) > 0 && is.data.frame(data$output$content[[1]])) {
-           out_str <- data$output$content[[1]]$text[1]
-       } else if (is.list(data$output) && !is.null(data$output[[1]]$content[[1]]$text)) {
-           out_str <- data$output[[1]]$content[[1]]$text
-       }
-    }
-    
-    # 4. 安全拦截 NULL 值，防止外层 observe 崩溃
-    if (is.null(out_str) || is.na(out_str) || out_str == "") {
-      print("Failed to parse text. Raw JSON returned:")
-      print(resp_text)
-      return("Risk: Unknown\nSpeed: N/A\nSuggestion: Empty response from AI.")
-    }
-    
-    return(as.character(out_str))
-    
-  }, error = function(e) { 
-    print(paste("R Network Error:", e$message))
-    return("Risk: Unknown\nSpeed: N/A\nSuggestion: Network connection failed.") 
-  })
-  
-  return(res)
-}
-
 # ==========================================
-# 3. 辅助服务与路由获取
+# 辅助服务与计算
 # ==========================================
 geocode_osm <- function(query) {
   safe_query <- URLencode(query)
@@ -156,15 +42,122 @@ get_osrm_route <- function(start_pt, end_pt) {
   return(NULL)
 }
 
+get_bearing <- function(lon1, lat1, lon2, lat2) {
+  rad <- pi / 180
+  dLon <- (lon2 - lon1) * rad
+  lat1 <- lat1 * rad
+  lat2 <- lat2 * rad
+  y <- sin(dLon) * cos(lat2)
+  x <- cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(dLon)
+  bearing <- atan2(y, x) / rad
+  return((bearing + 360) %% 360)
+}
+
+get_weather <- function(lat, lon) {
+  url <- sprintf("https://api.open-meteo.com/v1/forecast?latitude=%f&longitude=%f&current_weather=true", lat, lon)
+  res <- tryCatch({
+    req <- GET(url, timeout(3))
+    if (status_code(req) == 200) {
+      data <- fromJSON(content(req, "text", encoding = "UTF-8"))
+      code <- data$current_weather$weathercode
+      temp <- data$current_weather$temperature
+      
+      desc <- "Clear/Cloudy"
+      if (code %in% c(45,48)) desc <- "Fog"
+      if (code >= 51 && code <= 67) desc <- "Rain"
+      if (code >= 71 && code <= 86) desc <- "Snow"
+      if (code >= 95) desc <- "Thunderstorm"
+      
+      return(sprintf("%s, %.1f C", desc, temp))
+    }
+    return("Unknown Weather")
+  }, error = function(e) { return("Unknown Weather") })
+  return(res)
+}
+
+get_road_info <- function(lat, lon) {
+  url <- paste0("https://overpass-api.de/api/interpreter?data=[out:json];way(around:30,", lat, ",", lon, ")[\"highway\"];out tags;")
+  res <- tryCatch({
+    req <- GET(url, timeout(3))
+    if (status_code(req) == 200) {
+      data <- fromJSON(content(req, "text", encoding = "UTF-8"))
+      if (length(data$elements) > 0 && "tags" %in% names(data$elements)) {
+        tags <- data$elements$tags
+        maxspeed <- if ("maxspeed" %in% names(tags)) tags$maxspeed[1] else "Unknown"
+        road_name <- if ("name" %in% names(tags)) tags$name[1] else "Local Road"
+        return(sprintf("Road: %s, Speed Limit: %s", road_name, maxspeed))
+      }
+    }
+    return("Road Info: Unknown")
+  }, error = function(e) { return("Road Info: Unknown") })
+  return(res)
+}
+
+call_archia_agent <- function(prompt_text) {
+  archia_api_key <- "ask_6aHeqetNVu285mInrck-QgybeJK14AcZGOQNlSlZ7XE=" 
+  archia_endpoint <- "https://registry.archia.app/v1/responses" 
+  agent_name <- "TrafficCopilot" 
+  
+  res <- tryCatch({
+    req <- POST(
+      url = archia_endpoint,
+      add_headers(
+        Authorization = paste("Bearer", archia_api_key), 
+        `Content-Type` = "application/json"
+      ),
+      body = toJSON(list(
+        model = paste0("agent:", agent_name),
+        input = prompt_text
+      ), auto_unbox = TRUE),
+      timeout(8) 
+    )
+    
+    resp_text <- content(req, "text", encoding = "UTF-8")
+    
+    if (status_code(req) != 200) {
+       print(paste("Archia HTTP Error:", status_code(req)))
+       return("Risk: Unknown\nSpeed: N/A\nSuggestion: API Server Error.")
+    }
+    
+    data <- fromJSON(resp_text)
+    
+    if (!is.null(data$status)) {
+       if (data$status == "failed") {
+           err_msg <- if(!is.null(data$error$message)) data$error$message else "Unknown error"
+           print(paste("Archia Returned Failed Status:", err_msg))
+           return("Risk: Unknown\nSpeed: N/A\nSuggestion: Agent processing failed.")
+       } else if (data$status != "completed") {
+           return("Risk: Unknown\nSpeed: N/A\nSuggestion: Agent status not completed.")
+       }
+    }
+    
+    out_str <- NULL
+    if (!is.null(data$output)) {
+       if (is.data.frame(data$output) && length(data$output$content) > 0 && is.data.frame(data$output$content[[1]])) {
+           out_str <- data$output$content[[1]]$text[1]
+       } else if (is.list(data$output) && !is.null(data$output[[1]]$content[[1]]$text)) {
+           out_str <- data$output[[1]]$content[[1]]$text
+       }
+    }
+    
+    if (is.null(out_str) || is.na(out_str) || out_str == "") {
+      return("Risk: Unknown\nSpeed: N/A\nSuggestion: Empty response from AI.")
+    }
+    return(as.character(out_str))
+  }, error = function(e) { 
+    return("Risk: Unknown\nSpeed: N/A\nSuggestion: Network connection failed.") 
+  })
+  return(res)
+}
+
 # ==========================================
-# 4. 后端 Server 逻辑
+# 核心 Server 逻辑
 # ==========================================
 server <- function(input, output, session) {
   
   current_location <- reactiveVal(c(lon = -92.3341, lat = 38.9517))
   current_date <- mdy("1/24/2021") 
   
-  # 【视觉升级】：放大基准半径，增强光晕警示效果
   buffer_radius  <- 45     
   n_fade_rings   <- 10     
   
@@ -174,14 +167,22 @@ server <- function(input, output, session) {
 
   model_epsg <- 26915
   model_crs  <- sf::st_crs(model_epsg)
+  
+  is_navigating <- reactiveVal(FALSE)
+  current_route_sf <- reactiveVal(NULL)
+  view_mode <- reactiveVal("centered") 
+  route_bearing <- reactiveVal(0)
+  route_bounds <- reactiveVal(NULL)
 
   observeEvent(input$user_location, {
     req(input$user_location)
     loc <- c(lon = as.numeric(input$user_location$lon), lat = as.numeric(input$user_location$lat))
     current_location(loc)
     
+    current_zoom <- if(is_navigating() && view_mode() == "centered") 18 else 15
+    
     leafletProxy("map") %>%
-      setView(lng = loc["lon"], lat = loc["lat"], zoom = 15) %>%
+      setView(lng = loc["lon"], lat = loc["lat"], zoom = current_zoom) %>%
       removeMarker(layerId = "current_loc") %>%
       addCircleMarkers(lng = loc["lon"], lat = loc["lat"],
                        radius = 10, color = "#fff", weight = 3, fillColor = "#007AFF",
@@ -205,9 +206,6 @@ server <- function(input, output, session) {
 
   pp_rv  <- reactive({ req(model_fit()); model_fit()$pp })
   dat_rv <- reactive({ req(model_fit()); model_fit()$dat })
-
-  is_navigating <- reactiveVal(FALSE)
-  current_route_sf <- reactiveVal(NULL)
 
   output$map <- renderLeaflet({
     loc <- isolate(current_location())
@@ -247,31 +245,56 @@ server <- function(input, output, session) {
     leafletProxy("map") %>% clearGroup("search_res") %>% setView(lng = click$lng, lat = click$lat, zoom = 15) %>%
       addCircleMarkers(lng = click$lng, lat = click$lat, group = "search_res", radius = 10, color = "#fff", weight = 3, fillColor = "#FF3B30", fillOpacity = 1, label = dest_name, labelOptions = labelOptions(noHide = TRUE, textOnly = TRUE, className = "ios-map-label", direction = "top", offset = c(0, -10)))
     
-    js_code <- sprintf("$('#q_input').val('%s'); $('#q_input').attr('data-clicked-lat', %f); $('#q_input').attr('data-clicked-lon', %f); $('#search_panel').addClass('active'); $('#global_overlay').addClass('active'); $('#bottom_tray').addClass('panel-open'); $('#risk_btn').addClass('panel-open'); $('.loc-btn').addClass('panel-open');", dest_name, click$lat, click$lng)
+    js_code <- sprintf("$('#q_input').val('%s'); $('#q_input').attr('data-clicked-lat', %f); $('#q_input').attr('data-clicked-lon', %f); $('#search_panel').addClass('active'); $('#global_overlay').addClass('active'); $('#bottom_tray').addClass('panel-open'); $('#risk_btn').addClass('panel-open'); $('#view_capsule').addClass('panel-open');", dest_name, click$lat, click$lng)
     shinyjs::runjs(js_code)
   })
 
-  observeEvent(input$risk_btn, { shinyjs::addClass("risk_panel", "active"); shinyjs::addClass("global_overlay", "active"); shinyjs::addClass("risk_btn", "panel-open"); shinyjs::addClass("bottom_tray", "panel-open"); shinyjs::addClass("my_loc_btn", "panel-open") })
-  observeEvent(input$settings_btn, { shinyjs::addClass("settings_panel", "active"); shinyjs::addClass("global_overlay", "active"); shinyjs::addClass("bottom_tray", "panel-open"); shinyjs::addClass("risk_btn", "panel-open"); shinyjs::addClass("my_loc_btn", "panel-open") })
+  observeEvent(input$risk_btn, { shinyjs::addClass("risk_panel", "active"); shinyjs::addClass("global_overlay", "active"); shinyjs::addClass("risk_btn", "panel-open"); shinyjs::addClass("bottom_tray", "panel-open"); shinyjs::addClass("view_capsule", "panel-open") })
+  observeEvent(input$settings_btn, { shinyjs::addClass("settings_panel", "active"); shinyjs::addClass("global_overlay", "active"); shinyjs::addClass("bottom_tray", "panel-open"); shinyjs::addClass("risk_btn", "panel-open"); shinyjs::addClass("view_capsule", "panel-open") })
   observeEvent(input$search_trigger, { 
     if (is_navigating()) return()
-    shinyjs::addClass("search_panel", "active"); shinyjs::addClass("global_overlay", "active"); shinyjs::addClass("bottom_tray", "panel-open"); shinyjs::addClass("risk_btn", "panel-open"); shinyjs::addClass("my_loc_btn", "panel-open") 
+    shinyjs::addClass("search_panel", "active"); shinyjs::addClass("global_overlay", "active"); shinyjs::addClass("bottom_tray", "panel-open"); shinyjs::addClass("risk_btn", "panel-open"); shinyjs::addClass("view_capsule", "panel-open") 
   })
   observeEvent(c(input$close_all, input$c1, input$c2, input$c3), {
-    shinyjs::removeClass("risk_panel", "active"); shinyjs::removeClass("settings_panel", "active"); shinyjs::removeClass("search_panel", "active"); shinyjs::removeClass("global_overlay", "active"); shinyjs::removeClass("risk_btn", "panel-open"); shinyjs::removeClass("bottom_tray", "panel-open"); shinyjs::removeClass("my_loc_btn", "panel-open")
+    shinyjs::removeClass("risk_panel", "active"); shinyjs::removeClass("settings_panel", "active"); shinyjs::removeClass("search_panel", "active"); shinyjs::removeClass("global_overlay", "active"); shinyjs::removeClass("risk_btn", "panel-open"); shinyjs::removeClass("bottom_tray", "panel-open"); shinyjs::removeClass("view_capsule", "panel-open")
     shinyjs::runjs("setTimeout(hideSubViews, 300);")
   }, ignoreInit = TRUE)
   
   observeEvent(input$trigger_loc_btn, { 
     loc <- current_location()
-    leafletProxy("map") %>% setView(lng = loc["lon"], lat = loc["lat"], zoom = 15) 
+    if (is_navigating()) {
+      view_mode("centered")
+      session$sendCustomMessage("set_map_rotation", list(deg = -route_bearing(), mode = "centered"))
+      leafletProxy("map") %>% setView(lng = loc["lon"], lat = loc["lat"], zoom = 18)
+    } else {
+      leafletProxy("map") %>% setView(lng = loc["lon"], lat = loc["lat"], zoom = 15)
+    }
+  })
+  
+  observeEvent(input$trigger_toggle_view, {
+    req(is_navigating())
+    if (view_mode() == "centered") {
+      view_mode("global")
+      b <- route_bounds()
+      session$sendCustomMessage("set_map_rotation", list(deg = 0, mode = "global", bounds = b))
+    } else {
+      view_mode("centered")
+      session$sendCustomMessage("set_map_rotation", list(deg = -route_bearing(), mode = "centered"))
+      loc <- current_location()
+      leafletProxy("map") %>% setView(lng = loc["lon"], lat = loc["lat"], zoom = 18)
+    }
   })
   
   observeEvent(input$trigger_end_nav, {
     is_navigating(FALSE)
     current_route_sf(NULL) 
+    route_bounds(NULL)
+    view_mode("centered")
+    
+    session$sendCustomMessage("set_map_rotation", list(deg = 0, mode = "global"))
+    
     loc <- current_location()
-    leafletProxy("map") %>% clearGroup("search_res") %>% clearGroup("risk_halos") %>% setView(lng = loc["lon"], lat = loc["lat"], zoom = 14)
+    leafletProxy("map") %>% clearGroup("search_res") %>% clearGroup("risk_halos") %>% setView(lng = loc["lon"], lat = loc["lat"], zoom = 15)
     session$sendCustomMessage("end_nav_ui", list())
   })
   
@@ -288,7 +311,6 @@ server <- function(input, output, session) {
     req(input$do_custom_route)
     start_str <- trimws(input$do_custom_route$start)
     end_str <- trimws(input$do_custom_route$end)
-    shinyjs::runjs("Shiny.setInputValue('close_all', Math.random());") 
     
     start_loc <- NULL
     if (tolower(start_str) %in% c("current location", "my location", "")) {
@@ -317,10 +339,28 @@ server <- function(input, output, session) {
     
     if (!is.null(route_data)) {
       is_navigating(TRUE) 
-      map_proxy %>% addPolylines(lng = route_data$coords[,1], lat = route_data$coords[,2], color = "#007AFF", weight = 6, opacity = 0.8, group = "search_res") %>%
-        fitBounds(lng1 = min(start_loc["lon"], dest_loc["lon"]), lat1 = min(start_loc["lat"], dest_loc["lat"]), lng2 = max(start_loc["lon"], dest_loc["lon"]), lat2 = max(start_loc["lat"], dest_loc["lat"]))
+      view_mode("centered")
+      
+      coords <- route_data$coords
+      pt1 <- coords[1, ]
+      pt2_idx <- min(10, nrow(coords)) 
+      pt2 <- coords[pt2_idx, ]
+      
+      bearing <- get_bearing(pt1[1], pt1[2], pt2[1], pt2[2])
+      route_bearing(bearing)
+      
+      bnd <- list(
+        lng1 = min(start_loc["lon"], dest_loc["lon"]), lat1 = min(start_loc["lat"], dest_loc["lat"]), 
+        lng2 = max(start_loc["lon"], dest_loc["lon"]), lat2 = max(start_loc["lat"], dest_loc["lat"])
+      )
+      route_bounds(bnd)
+      
+      map_proxy %>% 
+        addPolylines(lng = coords[,1], lat = coords[,2], color = "#007AFF", weight = 6, opacity = 0.8, group = "search_res") %>%
+        setView(lng = start_loc["lon"], lat = start_loc["lat"], zoom = 18)
       
       session$sendCustomMessage("start_nav_ui", list(dist = round(route_data$dist / 1609.34, 1), time = max(1, round(route_data$time / 60))))
+      session$sendCustomMessage("set_map_rotation", list(deg = -bearing, mode = "centered"))
       shinyjs::runjs("$('#chk_risk_spot').prop('checked', true); Shiny.setInputValue('show_heatmap', true);")
       
       rc <- data.frame(lng = route_data$coords[,1], lat = route_data$coords[,2])
@@ -333,20 +373,17 @@ server <- function(input, output, session) {
     }
   })
 
-  # =================================================================================
-  # 核心渲染与状态更新
-  # =================================================================================
   observeEvent(list(input$show_heatmap, current_route_sf(), pp_rv(), current_location()), {
     if (is.null(input$show_heatmap) || !input$show_heatmap) {
       session$sendCustomMessage("update_risk_level", list(level = "Off"))
-      session$sendCustomMessage("update_ai_advice", list(text = "AI Suggestion will appear here..."))
+      session$sendCustomMessage("update_ai_advice", list(text = "Please turn on 'Risk Spot' or start navigation to view AI suggestions."))
       leafletProxy("map") %>% clearGroup("risk_halos") %>% clearGroup("current_risk_halo")
       return()
     }
     
     req(pp_rv())
     map_proxy <- leafletProxy("map")
-    session$sendCustomMessage("update_ai_advice", list(text = "Archia is analyzing environment context..."))
+    session$sendCustomMessage("update_ai_advice", list(text = "TraffIQ is analyzing environment context..."))
     
     loc <- current_location()
     curr_pt <- st_sfc(st_point(c(loc["lon"], loc["lat"])), crs=4326) %>% st_transform(model_crs)
@@ -375,9 +412,11 @@ server <- function(input, output, session) {
     weather_cond <- get_weather(loc["lat"], loc["lon"])
     road_info <- get_road_info(loc["lat"], loc["lon"])
     
+    user_risk_tolerance <- if (is.null(input$risk)) "Moderate" else input$risk
+    
     agent_input <- sprintf(
-      "System Input:\n- Raw Spatial Risk Score: %e\n- Location: [%f, %f]\n- Current Time: %s\n- Weather: %s\n- %s\n\nTask: Evaluate driving risk. Output EXACTLY 3 lines:\nRisk: [Low/Medium/High]\nSpeed: [X mph]\nSuggestion: [1 brief sentence]",
-      curr_raw_val, loc["lat"], loc["lon"], current_time_str, weather_cond, road_info
+      "System Input:\n- Raw Spatial Risk Score: %e\n- User Risk Tolerance: %s\n- Location: [%f, %f]\n- Current Time: %s\n- Weather: %s\n- %s\n\nTask: Evaluate driving risk factoring in the user's risk tolerance. Output EXACTLY 3 lines:\nRisk: [Low/Medium/High]\nSpeed: [X mph]\nSuggestion: [1 brief sentence]",
+      curr_raw_val, user_risk_tolerance, loc["lat"], loc["lon"], current_time_str, weather_cond, road_info
     )
     
     ai_response <- call_archia_agent(agent_input)
@@ -403,13 +442,8 @@ server <- function(input, output, session) {
     
     curr_color <- if (parsed_level == "High") col_red else if (parsed_level == "Medium") col_yellow else col_green
     
-    # -------------------------------------------------------------
-    # 【视觉优化】：提升透明度，放大同心圆扩散半径
-    # -------------------------------------------------------------
     map_proxy %>% clearGroup("current_risk_halo")
     radii_curr <- seq(buffer_radius, 1, length.out = n_fade_rings)
-    
-    # 提高单层透明度，让中心更浓郁实色 (1.5 / n_fade_rings)
     alpha_step_curr <- 1.5 / n_fade_rings 
     for (j in seq_len(n_fade_rings)) {
       map_proxy %>% addCircles(
@@ -418,7 +452,6 @@ server <- function(input, output, session) {
       )
     }
 
-    # 路线光晕处理 (向量化高亮渲染)
     map_proxy %>% clearGroup("risk_halos")
     if (is_navigating() && !is.null(current_route_sf())) {
       sample_pts_m <- tryCatch({
@@ -444,12 +477,9 @@ server <- function(input, output, session) {
             filter(!is.na(norm_val) & norm_val > 0.4) %>%
             mutate(color = ifelse(norm_val > 0.75, col_red, col_yellow))
 
-          # 路径专属光晕参数：比当前位置圆稍小，透明度高亮加倍
           route_buffer_radius <- buffer_radius * 0.75  
           radii_route <- seq(route_buffer_radius, 1, length.out = n_fade_rings)
-          
-          # 提升路线高亮可见度 (1.0 / n_fade_rings)
-          alpha_step_route <- 1.0 / n_fade_rings  
+          alpha_step_route <- 1.2 / n_fade_rings  
           
           for (j in seq_len(n_fade_rings)) {
             map_proxy %>% addCircles(

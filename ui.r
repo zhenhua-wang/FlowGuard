@@ -1,14 +1,10 @@
+# ==========================================
+# ui.r - 前端界面设计
+# ==========================================
 library(shiny)
 library(shinyMobile)
 library(leaflet)
-library(leaflet.extras)
 library(shinyjs)
-library(jsonlite)
-library(sf)
-library(terra)
-library(lubridate)
-library(dplyr)
-library(httr)
 
 ui <- f7Page(
   title = "FlowGuard",
@@ -40,10 +36,13 @@ ui <- f7Page(
         $('#' + activeInputId).val(shortName); $('#search_suggestions').empty().removeClass('active');
         Shiny.setInputValue('fly_to_loc', {lat: lat, lon: lon, name: shortName, type: activeInputId, rand: Math.random()});
       }
+      
       function triggerCustomRoute() {
         let start_val = $('#start_input').val().trim(); let end_val = $('#q_input').val().trim();
         let click_lat = $('#q_input').attr('data-clicked-lat'); let click_lon = $('#q_input').attr('data-clicked-lon');
         if(end_val === '') { alert('Please enter a destination.'); return; }
+        
+        Shiny.setInputValue('close_all', Math.random());
         Shiny.setInputValue('do_custom_route', {
           start: start_val, end: end_val, dest_lat: click_lat ? parseFloat(click_lat) : null, dest_lon: click_lon ? parseFloat(click_lon) : null, rand: Math.random()
         });
@@ -54,13 +53,34 @@ ui <- f7Page(
         $('#fg-toast').text(msg).addClass('show'); setTimeout(function() { $('#fg-toast').removeClass('show'); }, 3000);
       }
 
+      let watchId = null;
+      let lastLocTime = 0;
+
+      function startLocationTracking() {
+        if (\"geolocation\" in navigator) {
+          watchId = navigator.geolocation.watchPosition(function(position) {
+            let now = Date.now();
+            if (now - lastLocTime > 5000) {
+                lastLocTime = now;
+                Shiny.setInputValue(\"user_location\", {
+                    lat: position.coords.latitude,
+                    lon: position.coords.longitude,
+                    rand: Math.random()
+                });
+            }
+          }, function(error) {
+            console.warn(\"Geolocation watch error: \" + error.message);
+          }, { enableHighAccuracy: true, maximumAge: 2000, timeout: 10000 });
+        }
+      }
+
       function requestLocation() {
         if (\"geolocation\" in navigator) {
           navigator.geolocation.getCurrentPosition(function(position) {
             Shiny.setInputValue(\"user_location\", { lat: position.coords.latitude, lon: position.coords.longitude, rand: Math.random() });
-            showToast(\"Location retrieved successfully.\");
+            showToast(\"Location updated.\");
+            lastLocTime = Date.now(); 
           }, function(error) {
-            console.warn(\"Geolocation failed: \" + error.message);
             showToast(\"Failed to get location. Please allow GPS.\");
           }, { enableHighAccuracy: true, timeout: 10000 });
         } else {
@@ -92,19 +112,61 @@ ui <- f7Page(
         $(document).on('keyup', '#q_input, #start_input', function(e) { if(e.key === 'Enter' || e.keyCode === 13) { triggerCustomRoute(); $(this).blur(); } });
       });
 
-      $(document).on('shiny:connected', function() { requestLocation(); });
+      $(document).on('shiny:connected', function() { 
+          requestLocation(); 
+          startLocationTracking(); 
+      });
 
       Shiny.addCustomMessageHandler('start_nav_ui', function(msg) {
          $('#nav_time').text(msg.time + ' min'); $('#nav_dist').text(msg.dist + ' mi');
          $('#bottom_tray').addClass('nav-active'); $('#nav_info_panel').addClass('active');    
+         $('#view_capsule').addClass('nav-active'); 
          $('#q_input, #start_input').prop('disabled', true); $('.get-dir-btn').prop('disabled', true).css('opacity', '0.5');
          $('#search_trigger').css({'pointer-events': 'none', 'opacity': '0.5'});
       });
       
       Shiny.addCustomMessageHandler('end_nav_ui', function(msg) {
          $('#nav_info_panel').removeClass('active'); $('#bottom_tray').removeClass('nav-active'); 
+         $('#view_capsule').removeClass('nav-active'); 
          $('#q_input, #start_input').prop('disabled', false).val(''); $('#start_input').val('Current Location');
          $('.get-dir-btn').prop('disabled', false).css('opacity', '1'); $('#search_trigger').css({'pointer-events': 'auto', 'opacity': '1'});
+      });
+
+      Shiny.addCustomMessageHandler('set_map_rotation', function(msg) {
+         let mapEl = $('#fg-map');
+         if (msg.mode === 'global') {
+             mapEl.removeClass('map-driving-mode');
+             mapEl.css('transform', 'translate(-50%, -50%) rotate(0deg)');
+             $('#toggle_view_icon').text('explore'); 
+             
+             let count = 0;
+             let interval = setInterval(function() { window.dispatchEvent(new Event('resize')); count++; if(count > 10) clearInterval(interval); }, 50);
+             
+             if (msg.bounds) {
+                 setTimeout(function() {
+                     try {
+                         let mapObj = HTMLWidgets.getInstance(document.getElementById('map')).getMap();
+                         mapObj.invalidateSize(true); 
+                         mapObj.fitBounds([
+                             [msg.bounds.lat1, msg.bounds.lng1],
+                             [msg.bounds.lat2, msg.bounds.lng2]
+                         ], {
+                             paddingTopLeft: [50, 120],     
+                             paddingBottomRight: [50, 320], 
+                             animate: true,
+                             duration: 1
+                         });
+                     } catch(e) { console.log(e); }
+                 }, 450); 
+             }
+         } else {
+             mapEl.addClass('map-driving-mode');
+             mapEl.css('transform', 'translate(-50%, -50%) rotate(' + msg.deg + 'deg)');
+             $('#toggle_view_icon').text('route'); 
+             
+             let count = 0;
+             let interval = setInterval(function() { window.dispatchEvent(new Event('resize')); count++; if(count > 10) clearInterval(interval); }, 50);
+         }
       });
       
       Shiny.addCustomMessageHandler('update_risk_level', function(msg) {
@@ -122,7 +184,14 @@ ui <- f7Page(
 
     tags$style(HTML("
       body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; overflow: hidden; }
-      #fg-map { position: fixed; top: 0; bottom: 0; left: 0; right: 0; z-index: 1; }
+      
+      #fg-map { 
+        position: fixed; top: 50%; left: 50%; width: 100vw; height: 100vh; 
+        transform: translate(-50%, -50%) rotate(0deg); z-index: 1; 
+        transition: transform 1.2s cubic-bezier(0.68, -0.55, 0.265, 1.55); 
+      }
+      #fg-map.map-driving-mode { width: 150vmax; height: 150vmax; }
+      
       :root { --ios-glass-bg: rgba(255, 255, 255, 0.45); --ios-glass-blur: blur(35px) saturate(190%); --ios-glass-border: 1px solid rgba(255, 255, 255, 0.5); --ios-glass-shadow: 0 10px 30px rgba(0,0,0,0.15); }
       .material-symbols-rounded { font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24; font-size: 28px; display: flex; align-items: center; justify-content: center; transition: color 0.4s ease; }
       .risk-indicator .material-symbols-rounded { color: #000; }
@@ -172,6 +241,7 @@ ui <- f7Page(
       @keyframes glow-low { 0% { box-shadow: 0 0 0 0 rgba(52, 199, 89, 0.5); } 70% { box-shadow: 0 0 0 15px rgba(52, 199, 89, 0); } 100% { box-shadow: 0 0 0 0 rgba(52, 199, 89, 0); } }
       @keyframes glow-medium { 0% { box-shadow: 0 0 0 0 rgba(255, 204, 0, 0.6); } 70% { box-shadow: 0 0 0 15px rgba(255, 204, 0, 0); } 100% { box-shadow: 0 0 0 0 rgba(255, 204, 0, 0); } }
       @keyframes glow-high { 0% { box-shadow: 0 0 0 0 rgba(255, 59, 48, 0.6); } 70% { box-shadow: 0 0 0 15px rgba(255, 59, 48, 0); } 100% { box-shadow: 0 0 0 0 rgba(255, 59, 48, 0); } }
+      
       .risk-indicator { position: fixed; top: 16px; left: 12px; height: 46px; width: 46px; z-index: 999999 !important; background: var(--ios-glass-bg) !important; backdrop-filter: var(--ios-glass-blur); -webkit-backdrop-filter: var(--ios-glass-blur); border: var(--ios-glass-border); border-radius: 23px; box-shadow: var(--ios-glass-shadow); padding: 0; outline: none; cursor: pointer; transform: translateZ(0); display: flex; align-items: center; justify-content: center; transition: width 0.4s cubic-bezier(0.19, 1, 0.22, 1), transform 0.6s cubic-bezier(0.19, 1, 0.22, 1), border-color 0.4s ease; }
       .risk-indicator.panel-open { transform: translateY(-100px) scale(0.8); pointer-events: none; }
       .risk-indicator.risk-active { width: 125px; }
@@ -183,13 +253,37 @@ ui <- f7Page(
       .risk-medium .material-symbols-rounded, .risk-medium #risk_text { color: #ffcc00 !important; }
       .risk-high { animation: glow-high 1s infinite; border: 1px solid rgba(255,59,48,0.5) !important; }
       .risk-high .material-symbols-rounded, .risk-high #risk_text { color: #ff3b30 !important; }
+      
       .fg-bottombar { position: fixed; bottom: 32px; left: 0; right: 0; z-index: 999998 !important; display: flex; align-items: center; justify-content: center; gap: 14px; pointer-events: none; transition: transform 0.6s cubic-bezier(0.19, 1, 0.22, 1); }
       .fg-bottombar.panel-open, .fg-bottombar.nav-active { transform: translateY(150px); pointer-events: none; transition: transform 0.4s cubic-bezier(0.19, 1, 0.22, 1); }
       .fg-iconbtn, .fg-search-trigger { pointer-events: auto; background: var(--ios-glass-bg) !important; backdrop-filter: var(--ios-glass-blur); -webkit-backdrop-filter: var(--ios-glass-blur); border: var(--ios-glass-border); box-shadow: var(--ios-glass-shadow); transform: translateZ(0); transition: opacity 0.3s; }
       .fg-iconbtn { width: 46px; height: 46px; border-radius: 23px; display: flex; align-items: center; justify-content: center; border:none; outline: none; }
       .fg-search-trigger { width: 65%; max-width: 320px; height: 46px; border-radius: 23px; display: flex; justify-content: space-between; align-items: center; padding: 0 16px 0 20px; color: #666; font-size: 16px; font-weight: 500; cursor: pointer; }
-      .loc-btn { position: fixed; right: 12px; bottom: 100px; z-index: 999997 !important; width: 46px; height: 46px; border-radius: 23px; display: flex; align-items: center; justify-content: center; background: var(--ios-glass-bg) !important; backdrop-filter: var(--ios-glass-blur); -webkit-backdrop-filter: var(--ios-glass-blur); border: var(--ios-glass-border); box-shadow: var(--ios-glass-shadow); cursor: pointer; outline: none; border: none; transition: transform 0.6s cubic-bezier(0.19, 1, 0.22, 1); }
-      .loc-btn.panel-open { transform: translateX(100px); pointer-events: none; }
+      
+      .view-capsule {
+        position: fixed; right: 12px; bottom: 160px; z-index: 999997 !important;
+        background: var(--ios-glass-bg) !important; backdrop-filter: var(--ios-glass-blur); -webkit-backdrop-filter: var(--ios-glass-blur);
+        border: var(--ios-glass-border); box-shadow: var(--ios-glass-shadow);
+        border-radius: 23px; display: flex; flex-direction: column; overflow: hidden;
+        height: 46px; 
+        transition: transform 0.6s cubic-bezier(0.19, 1, 0.22, 1), height 0.4s cubic-bezier(0.19, 1, 0.22, 1);
+      }
+      .view-capsule.panel-open { transform: translateX(100px); pointer-events: none; }
+      .view-capsule.nav-active { height: 93px; } 
+      
+      .capsule-btn {
+        width: 46px; height: 46px; flex-shrink: 0; border: none; background: transparent; outline: none;
+        display: flex; align-items: center; justify-content: center; cursor: pointer;
+        transition: background 0.2s ease;
+      }
+      .capsule-btn:active { background: rgba(0,0,0,0.1); }
+      
+      .toggle-view-btn { display: none !important; }
+      .capsule-divider { width: 30px; height: 1px; flex-shrink: 0; background: rgba(0,0,0,0.15); margin: 0 auto; display: none !important; }
+
+      .view-capsule.nav-active .toggle-view-btn { display: flex !important; }
+      .view-capsule.nav-active .capsule-divider { display: block !important; }
+
       .nav-info-panel { position: fixed; bottom: 32px; left: 16px; right: 16px; max-width: 400px; margin: 0 auto; z-index: 999998 !important; background: var(--ios-glass-bg) !important; backdrop-filter: var(--ios-glass-blur); -webkit-backdrop-filter: var(--ios-glass-blur); border: var(--ios-glass-border); border-radius: 24px; box-shadow: var(--ios-glass-shadow); display: flex; justify-content: space-between; align-items: center; padding: 12px 20px; transform: translateY(150px); pointer-events: none; transition: transform 0.6s cubic-bezier(0.19, 1, 0.22, 1); }
       .nav-info-panel.active { transform: translateY(0); pointer-events: auto; }
       .nav-text-container { display: flex; align-items: baseline; gap: 8px; }
@@ -227,10 +321,18 @@ ui <- f7Page(
   div(id = "fg-map", leafletOutput("map", height = "100%")),
   div(id = "global_overlay", onclick = "Shiny.setInputValue('close_all', Math.random())"),
 
-  tags$button(
-    id = "my_loc_btn", class = "action-button loc-btn", 
-    onclick = "requestLocation(); Shiny.setInputValue('trigger_loc_btn', Math.random())",
-    tags$span(class = "material-symbols-rounded", style="color: #007AFF; font-size: 26px;", "my_location")
+  div(id = "view_capsule", class = "view-capsule",
+    tags$button(
+      id = "toggle_view_btn", class = "capsule-btn toggle-view-btn",
+      onclick = "Shiny.setInputValue('trigger_toggle_view', Math.random())",
+      tags$span(id = "toggle_view_icon", class = "material-symbols-rounded", style="color: #007AFF; font-size: 26px;", "explore")
+    ),
+    div(class = "capsule-divider"),
+    tags$button(
+      id = "my_loc_btn", class = "capsule-btn", 
+      onclick = "requestLocation(); Shiny.setInputValue('trigger_loc_btn', Math.random())",
+      tags$span(class = "material-symbols-rounded", style="color: #007AFF; font-size: 26px;", "my_location")
+    )
   ),
 
   div(id = "risk_panel", class = "ios-panel",
@@ -240,7 +342,7 @@ ui <- f7Page(
       div(class = "ios-group", div(class = "ios-row no-click", div(class = "ios-row-title", "Risk Spot"), tags$label(class = "ios-switch", tags$input(id = "chk_risk_spot", type = "checkbox", onchange = "Shiny.setInputValue('show_heatmap', this.checked)"), tags$span(class = "ios-slider-toggle")))),
       div(class = "ios-section-title", "AI DRIVING ASSISTANT"),
       div(class = "ios-group", div(style = "padding: 20px; min-height: 80px; display: flex; flex-direction: column; justify-content: center; align-items: flex-start;", 
-          div(id = "ai_advice_text", style = "color: #8E8E93; font-size: 15px; text-align: left; font-style: italic;", "AI Suggestion will appear here...")
+          div(id = "ai_advice_text", style = "color: #8E8E93; font-size: 15px; text-align: left; font-style: italic;", "Please turn on 'Risk Spot' or start navigation to view AI suggestions.")
       ))
     )
   ),
