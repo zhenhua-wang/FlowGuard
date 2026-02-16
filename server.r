@@ -1,3 +1,6 @@
+# ==========================================
+# server.R - 后端业务逻辑与模型处理
+# ==========================================
 library(shiny)
 library(leaflet)
 library(leaflet.extras)
@@ -11,6 +14,9 @@ library(httr)
 
 source("./lgcp_utils.r")
 
+# ==========================================
+# 辅助服务与计算
+# ==========================================
 get_weather <- function(lat, lon) {
   url <- sprintf("https://api.open-meteo.com/v1/forecast?latitude=%f&longitude=%f&current_weather=true", lat, lon)
   res <- tryCatch({
@@ -19,11 +25,13 @@ get_weather <- function(lat, lon) {
       data <- fromJSON(content(req, "text", encoding = "UTF-8"))
       code <- data$current_weather$weathercode
       temp <- data$current_weather$temperature
+      
       desc <- "Clear/Cloudy"
       if (code %in% c(45,48)) desc <- "Fog"
       if (code >= 51 && code <= 67) desc <- "Rain"
       if (code >= 71 && code <= 86) desc <- "Snow"
       if (code >= 95) desc <- "Thunderstorm"
+      
       return(sprintf("%s, %.1f C", desc, temp))
     }
     return("Unknown Weather")
@@ -142,6 +150,9 @@ get_bearing <- function(lon1, lat1, lon2, lat2) {
   return((bearing + 360) %% 360)
 }
 
+# ==========================================
+# 核心 Server 逻辑
+# ==========================================
 function(input, output, session) {
   
   current_location <- reactiveVal(c(lon = -92.3341, lat = 38.9517))
@@ -162,22 +173,28 @@ function(input, output, session) {
   view_mode <- reactiveVal("centered") 
   route_bearing <- reactiveVal(0)
   route_bounds <- reactiveVal(NULL)
+  
+  first_loc_fixed <- reactiveVal(FALSE)
+  last_agent_eval_state <- reactiveVal(list(tier = "", tolerance = "", parsed_level = "Low"))
 
   observeEvent(input$user_location, {
     req(input$user_location)
     loc <- c(lon = as.numeric(input$user_location$lon), lat = as.numeric(input$user_location$lat))
     current_location(loc)
     
-    current_zoom <- if(is_navigating() && view_mode() == "centered") 18 else 15
-    
-    leafletProxy("map") %>%
-      setView(lng = loc["lon"], lat = loc["lat"], zoom = current_zoom) %>%
+    map_proxy <- leafletProxy("map") %>%
       removeMarker(layerId = "current_loc") %>%
-      # 【配置层级】：个人坐标定位球放入 marker_pane，绝对悬浮最高层
       addCircleMarkers(lng = loc["lon"], lat = loc["lat"],
                        radius = 10, color = "#fff", weight = 3, fillColor = "#007AFF",
                        fillOpacity = 1, layerId = "current_loc",
                        options = pathOptions(pane = "marker_pane"))
+                       
+    if (!first_loc_fixed()) {
+      map_proxy %>% setView(lng = loc["lon"], lat = loc["lat"], zoom = 15)
+      first_loc_fixed(TRUE)
+    } else if (is_navigating() && view_mode() == "centered") {
+      map_proxy %>% setView(lng = loc["lon"], lat = loc["lat"], zoom = 18)
+    }
   })
 
   date_lags_rv <- reactive({
@@ -202,7 +219,6 @@ function(input, output, session) {
     loc <- isolate(current_location())
     leaflet(options = leafletOptions(zoomControl = FALSE)) %>%
       addTiles() %>%
-      # 【核心机制】：创建4个具有严格 z-index 层级的自定义面板，数字越大越在上方
       addMapPane("risk_pane", zIndex = 410) %>%
       addMapPane("traffic_pane", zIndex = 420) %>%
       addMapPane("route_pane", zIndex = 430) %>%
@@ -356,7 +372,6 @@ function(input, output, session) {
       )
       route_bounds(bnd)
       
-      # 【配置层级】：将路线放在 route_pane 里面 (夹在光晕上方和定位点下方)
       map_proxy %>% 
         addPolylines(lng = coords[,1], lat = coords[,2], color = "#007AFF", weight = 6, opacity = 0.8, group = "search_res", options = pathOptions(pane = "route_pane")) %>%
         setView(lng = start_loc["lon"], lat = start_loc["lat"], zoom = 18)
@@ -375,17 +390,19 @@ function(input, output, session) {
     }
   })
 
-  observeEvent(list(input$show_heatmap, current_route_sf(), pp_rv(), current_location()), {
+  observeEvent(list(input$show_heatmap, current_route_sf(), pp_rv(), current_location(), input$risk), {
+    
     if (is.null(input$show_heatmap) || !input$show_heatmap) {
       session$sendCustomMessage("update_risk_level", list(level = "Off"))
       session$sendCustomMessage("update_ai_advice", list(text = "Please turn on 'Risk Spot' or start navigation to view AI suggestions."))
       leafletProxy("map") %>% clearGroup("risk_halos") %>% clearGroup("current_risk_halo")
+      
+      last_agent_eval_state(list(tier = "", tolerance = "", parsed_level = "Low"))
       return()
     }
     
     req(pp_rv())
     map_proxy <- leafletProxy("map")
-    session$sendCustomMessage("update_ai_advice", list(text = "Archia is analyzing environment context..."))
     
     loc <- current_location()
     curr_pt <- st_sfc(st_point(c(loc["lon"], loc["lat"])), crs=4326) %>% st_transform(model_crs)
@@ -410,37 +427,57 @@ function(input, output, session) {
        if (!is.na(val)) curr_raw_val <- val
     }
     
-    current_time_str <- format(Sys.time(), "%I:%M %p")
-    weather_cond <- get_weather(loc["lat"], loc["lon"])
-    road_info <- get_road_info(loc["lat"], loc["lon"])
+    current_tier <- "Low"
+    if (curr_raw_val >= 1.0e-06) {
+      current_tier <- "High"
+    } else if (curr_raw_val >= 1.0e-07) {
+      current_tier <- "Medium"
+    }
     
     user_risk_tolerance <- if (is.null(input$risk)) "Moderate" else input$risk
     
-    agent_input <- sprintf(
-      "System Input:\n- Raw Spatial Risk Score: %e\n- User Risk Tolerance: %s\n- Location: [%f, %f]\n- Current Time: %s\n- Weather: %s\n- %s\n\nTask: Evaluate driving risk factoring in the user's risk tolerance. Output EXACTLY 3 lines:\nRisk: [Low/Medium/High]\nSpeed: [X mph]\nSuggestion: [1 brief sentence]",
-      curr_raw_val, user_risk_tolerance, loc["lat"], loc["lon"], current_time_str, weather_cond, road_info
-    )
+    old_state <- last_agent_eval_state()
+    state_changed <- (old_state$tier != current_tier) || (old_state$tolerance != user_risk_tolerance)
     
-    ai_response <- call_archia_agent(agent_input)
+    parsed_level <- old_state$parsed_level 
     
-    if (length(ai_response) == 0 || is.na(ai_response) || is.null(ai_response)) {
-      ai_response <- "Risk: Unknown\nSpeed: N/A\nSuggestion: Unrecognized Agent output."
+    if (state_changed) {
+      current_time_str <- format(Sys.time(), "%I:%M %p")
+      weather_cond <- get_weather(loc["lat"], loc["lon"])
+      road_info <- get_road_info(loc["lat"], loc["lon"])
+      
+      # 【修改】：精简 R 语言构建给 Agent 的包裹，防止与 System Prompt 冲撞
+      agent_input <- sprintf(
+        "Real-time INPUT CONTEXT:\n- Raw Spatial Risk Score: %e\n- User Risk Tolerance: %s\n- Location: [%f, %f]\n- Current Time: %s\n- Weather: %s\n- %s",
+        curr_raw_val, user_risk_tolerance, loc["lat"], loc["lon"], current_time_str, weather_cond, road_info
+      )
+      
+      # 因为只在风险变化时触发，可以先发一个状态更新 UI
+      session$sendCustomMessage("update_ai_advice", list(text = "TraffIQ is analyzing environment context..."))
+      
+      ai_response <- call_archia_agent(agent_input)
+      
+      if (length(ai_response) == 0 || is.na(ai_response) || is.null(ai_response)) {
+        ai_response <- "Risk: Unknown\nSpeed: N/A\nSuggestion: Unrecognized Agent output."
+      }
+      ai_response <- paste(ai_response, collapse = "\n")
+      
+      parsed_level <- "Low"
+      if (is.character(ai_response) && length(ai_response) > 0) {
+        if (grepl("Risk:\\s*High", ai_response, ignore.case = TRUE)) parsed_level <- "High"
+        else if (grepl("Risk:\\s*Medium", ai_response, ignore.case = TRUE)) parsed_level <- "Medium"
+      }
+      
+      ui_text <- gsub("\\*\\*(?i)Risk:\\*\\*|(?i)Risk:", "<b>Risk:</b>", ai_response)
+      ui_text <- gsub("\\*\\*(?i)Speed:\\*\\*|(?i)Speed:", "<b>Speed:</b>", ui_text)
+      ui_text <- gsub("\\*\\*(?i)Suggestion:\\*\\*|(?i)Suggestion:|\\*\\*(?i)Advice:\\*\\*|(?i)Advice:", "<b>Suggestion:</b>", ui_text)
+      ui_text <- gsub("\\n", "<br/>", ui_text)
+      
+      session$sendCustomMessage("update_ai_advice", list(text = ui_text))
+      session$sendCustomMessage("update_risk_level", list(level = parsed_level))
+      
+      last_agent_eval_state(list(tier = current_tier, tolerance = user_risk_tolerance, parsed_level = parsed_level))
     }
-    ai_response <- paste(ai_response, collapse = "\n")
-    
-    parsed_level <- "Low"
-    if (is.character(ai_response) && length(ai_response) > 0) {
-      if (grepl("Risk:\\s*High", ai_response, ignore.case = TRUE)) parsed_level <- "High"
-      else if (grepl("Risk:\\s*Medium", ai_response, ignore.case = TRUE)) parsed_level <- "Medium"
-    }
-    
-    ui_text <- gsub("\\*\\*(?i)Risk:\\*\\*|(?i)Risk:", "<b>Risk:</b>", ai_response)
-    ui_text <- gsub("\\*\\*(?i)Speed:\\*\\*|(?i)Speed:", "<b>Speed:</b>", ui_text)
-    ui_text <- gsub("\\*\\*(?i)Suggestion:\\*\\*|(?i)Suggestion:|\\*\\*(?i)Advice:\\*\\*|(?i)Advice:", "<b>Suggestion:</b>", ui_text)
-    ui_text <- gsub("\\n", "<br/>", ui_text)
-    
-    session$sendCustomMessage("update_ai_advice", list(text = ui_text))
-    session$sendCustomMessage("update_risk_level", list(level = parsed_level))
     
     curr_color <- if (parsed_level == "High") col_red else if (parsed_level == "Medium") col_yellow else col_green
     
@@ -448,11 +485,9 @@ function(input, output, session) {
     radii_curr <- seq(buffer_radius, 1, length.out = n_fade_rings)
     alpha_step_curr <- 1.5 / n_fade_rings 
     for (j in seq_len(n_fade_rings)) {
-      # 【配置层级】：把当前位置的发光热力圈锁在 risk_pane 最底层
       map_proxy %>% addCircles(
         lng = loc["lon"], lat = loc["lat"], radius = radii_curr[j], group = "current_risk_halo", 
-        stroke = FALSE, fill = TRUE, fillColor = curr_color, fillOpacity = alpha_step_curr, 
-        options = pathOptions(clickable = FALSE, pane = "risk_pane")
+        stroke = FALSE, fill = TRUE, fillColor = curr_color, fillOpacity = alpha_step_curr, options = pathOptions(clickable = FALSE, pane = "risk_pane")
       )
     }
 
@@ -486,7 +521,6 @@ function(input, output, session) {
           alpha_step_route <- 1.2 / n_fade_rings  
           
           for (j in seq_len(n_fade_rings)) {
-            # 【配置层级】：把整条路线的发光热力圈也锁在 risk_pane 最底层
             map_proxy %>% addCircles(
               lng = risk_data$lng, lat = risk_data$lat, 
               radius = radii_route[j], group = "risk_halos", 
