@@ -135,7 +135,6 @@ f7Page(
              mapEl.css('transform', 'translate(-50%, -50%) rotate(0deg)');
              $('#toggle_view_icon').text('explore'); 
              
-             // 【核心动态层级】：全局模式下，将路线面板的 Z-index 降到 405 (沉在风险图层 410 之下)
              try {
                  let mapObj = HTMLWidgets.getInstance(document.getElementById('map')).getMap();
                  mapObj.getPane('route_pane').style.zIndex = 405; 
@@ -166,7 +165,6 @@ f7Page(
              mapEl.css('transform', 'translate(-50%, -50%) rotate(' + msg.deg + 'deg)');
              $('#toggle_view_icon').text('route'); 
              
-             // 【核心动态层级】：第一视角模式下，将路线面板的 Z-index 提至 430 (悬浮在风险图层 410 之上)
              try {
                  let mapObj = HTMLWidgets.getInstance(document.getElementById('map')).getMap();
                  mapObj.getPane('route_pane').style.zIndex = 430; 
@@ -241,7 +239,7 @@ f7Page(
       .slider-tooltip { position: absolute; top: -28px; transform: translateX(-50%); background: rgba(0, 0, 0, 0.8); color: #fff; padding: 4px 10px; border-radius: 8px; font-size: 14px; font-weight: 600; opacity: 0; pointer-events: none; transition: opacity 0.2s ease; white-space: nowrap; z-index: 10; box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
       .slider-tooltip.active { opacity: 1; }
       .slider-tooltip::after { content: ''; position: absolute; bottom: -4px; left: 50%; transform: translateX(-50%); border-width: 4px 5px 0; border-style: solid; border-color: rgba(0, 0, 0, 0.8) transparent transparent transparent; }
-      input[type=range].ios-slider { width: 100%; -webkit-appearance: none; background: transparent; height: 30px; --value: 48.27%; }
+      input[type=range].ios-slider { width: 100%; -webkit-appearance: none; background: transparent; height: 30px; --value: 13.79%; }
       input[type=range].ios-slider::-webkit-slider-thumb { -webkit-appearance: none; height: 26px; width: 26px; border-radius: 50%; background: #fff; box-shadow: 0 1px 5px rgba(0,0,0,0.3); cursor: pointer; margin-top: -11px; }
       input[type=range].ios-slider::-webkit-slider-runnable-track { width: 100%; height: 4px; border-radius: 2px; background: linear-gradient(to right, #34c759 0%, #34c759 var(--value), #D1D1D6 var(--value), #D1D1D6 100%); }
       .ios-switch { position: relative; display: inline-block; width: 51px; height: 31px; }
@@ -364,7 +362,9 @@ f7Page(
       div(class = "panel-header", style = "margin-bottom: 12px;", tags$h2(class = "panel-title", "Settings"), tags$button(id="c2", class="action-button panel-close-btn", "✕")),
       div(class = "ios-group", div(class = "ios-row", onclick = "showSubView('settings_sub_alerts')", div(class = "ios-row-title", "Alerts"), div(class = "ios-row-val", tags$span(id="val_alerts", "Sound, Vibrate"), tags$span(class="ios-chevron", "›")))),
       div(class = "ios-section-title", "DATA TRACEBACK DAYS"),
-      div(class = "ios-group", style = "overflow: visible;", div(class = "slider-row", tags$span(class = "slider-label", "1"), div(class = "slider-container", div(id = "slider_tooltip", class = "slider-tooltip", "15"), tags$input(type = "range", class = "ios-slider", min = "1", max = "30", value = "15", oninput = "updateSliderColor(this)", onmouseup = "hideSliderTooltip()", ontouchend = "hideSliderTooltip()")), tags$span(class = "slider-label", "30"))),
+      div(class = "ios-group", style = "overflow: visible;", div(class = "slider-row", tags$span(class = "slider-label", "1"), div(class = "slider-container", div(id = "slider_tooltip", class = "slider-tooltip", "5"), 
+      # 修改：默认 value 设为 5 
+      tags$input(type = "range", class = "ios-slider", min = "1", max = "30", value = "5", oninput = "updateSliderColor(this)", onmouseup = "hideSliderTooltip()", ontouchend = "hideSliderTooltip()")), tags$span(class = "slider-label", "30"))),
       div(class = "ios-group", div(class = "ios-row no-click", div(class = "ios-row-title", "Show Traffic Stops"), tags$label(class = "ios-switch", tags$input(type = "checkbox", onchange = "Shiny.setInputValue('individual_case', this.checked)"), tags$span(class = "ios-slider-toggle")))),
       div(class = "ios-group", div(class = "ios-row", onclick = "showSubView('settings_sub_risk')", div(class = "ios-row-title", "Risk Tolerance"), div(class = "ios-row-val", tags$span(id="val_risk", "Moderate"), tags$span(class="ios-chevron", "›"))))
     ),

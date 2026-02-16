@@ -144,8 +144,7 @@ get_bearing <- function(lon1, lat1, lon2, lat2) {
   return((bearing + 360) %% 360)
 }
 
-# 【修复报错的关键】：显式定义 server 变量
-server <- function(input, output, session) {
+function(input, output, session) {
   
   current_location <- reactiveVal(c(lon = -92.3341, lat = 38.9517))
   current_date <- mdy("1/24/2021") 
@@ -198,7 +197,7 @@ server <- function(input, output, session) {
   })
 
   date_lags_rv <- reactive({
-    if (is.null(input$traffic_days)) return(15) 
+    if (is.null(input$traffic_days)) return(5) 
     as.numeric(input$traffic_days)
   }) %>% debounce(800)
 
@@ -219,7 +218,6 @@ server <- function(input, output, session) {
     loc <- isolate(current_location())
     leaflet(options = leafletOptions(zoomControl = FALSE)) %>%
       addTiles() %>%
-      # 初始化时，我们将路线放在风险之下 (410 < 420)
       addMapPane("route_pane", zIndex = 410) %>%
       addMapPane("risk_pane", zIndex = 420) %>%
       addMapPane("traffic_pane", zIndex = 430) %>%
@@ -530,7 +528,7 @@ server <- function(input, output, session) {
       r_m <- terra::rast(pred[, c("x", "y", "p")], type = "xyz")
       terra::crs(r_m) <- model_crs$wkt
       
-      sample_pts_m <- tryCatch({ st_line_sample(road_m, density = 1/30) }, error = function(e) NULL)
+      sample_pts_m <- tryCatch({ st_line_sample(road_m, density = 1/50) }, error = function(e) NULL)
       
       if (!is.null(sample_pts_m) && length(sample_pts_m) > 0) {
         sample_pts_sf <- st_as_sf(st_cast(sample_pts_m, "POINT"))
@@ -549,12 +547,13 @@ server <- function(input, output, session) {
             filter(!is.na(raw_val) & raw_val >= dyn_thresh_med) %>%
             mutate(color = ifelse(raw_val >= dyn_thresh_high, col_red, col_yellow))
 
-          route_buffer_radius <- buffer_radius * 0.75  
-          radii_route <- seq(route_buffer_radius, 1, length.out = n_fade_rings)
-          alpha_step_route <- 1.2 / n_fade_rings  
+          route_buffer_radius <- buffer_radius * 0.8  
+          n_route_rings <- 3  
+          radii_route <- seq(route_buffer_radius, route_buffer_radius * 0.2, length.out = n_route_rings)
+          alpha_step_route <- 1.0 / n_route_rings  
           
           if (nrow(risk_data) > 0) {
-            for (j in seq_len(n_fade_rings)) {
+            for (j in seq_len(n_route_rings)) {
               map_proxy %>% addCircles(
                 lng = risk_data$lng, lat = risk_data$lat, 
                 radius = radii_route[j], group = "risk_halos", 
@@ -571,5 +570,4 @@ server <- function(input, output, session) {
        map_proxy %>% clearGroup("risk_halos")
     }
   }, ignoreInit = TRUE)
-
 }
