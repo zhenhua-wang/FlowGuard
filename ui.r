@@ -8,10 +8,8 @@ library(sf)
 library(terra)
 library(lubridate)
 library(dplyr)
+library(httr)
 
-# ==========================================
-# 1. 前端 UI 设计 
-# ==========================================
 ui <- f7Page(
   title = "FlowGuard",
   options = list(theme = "auto", dark = FALSE, filled = FALSE),
@@ -20,8 +18,6 @@ ui <- f7Page(
 
   tags$head(
     tags$link(rel = "stylesheet", href = "https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@24,400,0,0"),
-    
-    # --- 自定义交互 JS ---
     tags$script(HTML("
       function showSubView(id) { $('#settings_main').addClass('hidden-left'); $('#' + id).addClass('active'); }
       function hideSubViews() { $('#settings_main').removeClass('hidden-left'); $('.settings-subview').removeClass('active'); }
@@ -39,136 +35,91 @@ ui <- f7Page(
       function hideSliderTooltip() { document.getElementById('slider_tooltip').classList.remove('active'); }
       
       let activeInputId = 'q_input'; 
-
       function handleSuggestClick(el) {
-        let lat = $(el).attr('data-lat'); let lon = $(el).attr('data-lon'); 
-        let shortName = $(el).attr('data-short');
-        
-        $('#' + activeInputId).val(shortName);
-        $('#search_suggestions').empty().removeClass('active');
-        
+        let lat = $(el).attr('data-lat'); let lon = $(el).attr('data-lon'); let shortName = $(el).attr('data-short');
+        $('#' + activeInputId).val(shortName); $('#search_suggestions').empty().removeClass('active');
         Shiny.setInputValue('fly_to_loc', {lat: lat, lon: lon, name: shortName, type: activeInputId, rand: Math.random()});
       }
-
       function triggerCustomRoute() {
-        let start_val = $('#start_input').val().trim();
-        let end_val = $('#q_input').val().trim();
-        let click_lat = $('#q_input').attr('data-clicked-lat');
-        let click_lon = $('#q_input').attr('data-clicked-lon');
-        
+        let start_val = $('#start_input').val().trim(); let end_val = $('#q_input').val().trim();
+        let click_lat = $('#q_input').attr('data-clicked-lat'); let click_lon = $('#q_input').attr('data-clicked-lon');
         if(end_val === '') { alert('Please enter a destination.'); return; }
-        
         Shiny.setInputValue('do_custom_route', {
-          start: start_val, 
-          end: end_val, 
-          dest_lat: click_lat ? parseFloat(click_lat) : null,
-          dest_lon: click_lon ? parseFloat(click_lon) : null,
-          rand: Math.random()
+          start: start_val, end: end_val, dest_lat: click_lat ? parseFloat(click_lat) : null, dest_lon: click_lon ? parseFloat(click_lon) : null, rand: Math.random()
         });
-        
-        $('#q_input').removeAttr('data-clicked-lat');
-        $('#q_input').removeAttr('data-clicked-lon');
+        $('#q_input').removeAttr('data-clicked-lat'); $('#q_input').removeAttr('data-clicked-lon');
+      }
+      
+      function showToast(msg) {
+        $('#fg-toast').text(msg).addClass('show'); setTimeout(function() { $('#fg-toast').removeClass('show'); }, 3000);
+      }
+
+      function requestLocation() {
+        if (\"geolocation\" in navigator) {
+          navigator.geolocation.getCurrentPosition(function(position) {
+            Shiny.setInputValue(\"user_location\", { lat: position.coords.latitude, lon: position.coords.longitude, rand: Math.random() });
+            showToast(\"Location retrieved successfully.\");
+          }, function(error) {
+            console.warn(\"Geolocation failed: \" + error.message);
+            showToast(\"Failed to get location. Please allow GPS.\");
+          }, { enableHighAccuracy: true, timeout: 10000 });
+        } else {
+          showToast(\"Geolocation is not supported by your browser.\");
+        }
       }
 
       $(document).ready(function() {
         let timeout = null;
         $(document).on('focus input', '#start_input, #q_input', function() {
           activeInputId = $(this).attr('id'); 
-          if (activeInputId === 'q_input') {
-             $(this).removeAttr('data-clicked-lat'); $(this).removeAttr('data-clicked-lon');
-          }
-          clearTimeout(timeout);
-          let query = $(this).val().trim();
+          if (activeInputId === 'q_input') { $(this).removeAttr('data-clicked-lat'); $(this).removeAttr('data-clicked-lon'); }
+          clearTimeout(timeout); let query = $(this).val().trim();
           if (query.length < 2) { $('#search_suggestions').empty().removeClass('active'); return; }
           timeout = setTimeout(function() {
              let viewbox = '-93.0,39.5,-91.5,38.0'; 
              fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&format=json&limit=5&viewbox=${viewbox}`)
-             .then(r => r.json())
-             .then(data => {
+             .then(r => r.json()).then(data => {
                 let html = '';
                 data.forEach(item => {
                    let shortName = item.display_name.split(',')[0];
-                   html += `
-                     <div class=\"suggestion-item\" data-lat=\"${item.lat}\" data-lon=\"${item.lon}\" data-short=\"${shortName.replace(/\"/g, '&quot;')}\" onclick=\"handleSuggestClick(this)\">
-                        <div class=\"suggestion-text\"><div class=\"sugg-title\">${shortName}</div><div class=\"sugg-sub\">${item.display_name}</div></div>
-                     </div>
-                   `;
+                   html += `<div class=\"suggestion-item\" data-lat=\"${item.lat}\" data-lon=\"${item.lon}\" data-short=\"${shortName.replace(/\"/g, '&quot;')}\" onclick=\"handleSuggestClick(this)\"><div class=\"suggestion-text\"><div class=\"sugg-title\">${shortName}</div><div class=\"sugg-sub\">${item.display_name}</div></div></div>`;
                 });
                 if(html !== '') { $('#search_suggestions').html(html).addClass('active'); } 
                 else { $('#search_suggestions').html('<div style=\"padding: 16px; color: #888; text-align: center;\">No results found nearby</div>').addClass('active'); }
              }).catch(err => { console.error('Geocoding error:', err); });
           }, 400);
         });
-        
-        $(document).on('keyup', '#q_input, #start_input', function(e) {
-          if(e.key === 'Enter' || e.keyCode === 13) {
-            triggerCustomRoute(); $(this).blur();
-          }
-        });
-
-        // =====================================================================
-        // 调用浏览器原生 Geolocation API 获取实时物理定位
-        // =====================================================================
-        if (\"geolocation\" in navigator) {
-          navigator.geolocation.getCurrentPosition(function(position) {
-            Shiny.setInputValue(\"user_location\", {
-              lat: position.coords.latitude,
-              lon: position.coords.longitude,
-              rand: Math.random()
-            });
-          }, function(error) {
-            console.warn(\"Geolocation failed: \" + error.message);
-            showToast(\"Using default location. Enable GPS for real-time location.\");
-          }, { enableHighAccuracy: true, timeout: 10000 });
-        } else {
-          showToast(\"Geolocation is not supported by your browser.\");
-        }
+        $(document).on('keyup', '#q_input, #start_input', function(e) { if(e.key === 'Enter' || e.keyCode === 13) { triggerCustomRoute(); $(this).blur(); } });
       });
-      
-      function showToast(msg) {
-        $('#fg-toast').text(msg).addClass('show');
-        setTimeout(function() { $('#fg-toast').removeClass('show'); }, 3000);
-      }
+
+      $(document).on('shiny:connected', function() { requestLocation(); });
 
       Shiny.addCustomMessageHandler('start_nav_ui', function(msg) {
-         $('#nav_time').text(msg.time + ' min');
-         $('#nav_dist').text(msg.dist + ' mi');
-         $('#bottom_tray').addClass('nav-active');   
-         $('#nav_info_panel').addClass('active');    
-         
-         $('#q_input, #start_input').prop('disabled', true);
-         $('.get-dir-btn').prop('disabled', true).css('opacity', '0.5');
+         $('#nav_time').text(msg.time + ' min'); $('#nav_dist').text(msg.dist + ' mi');
+         $('#bottom_tray').addClass('nav-active'); $('#nav_info_panel').addClass('active');    
+         $('#q_input, #start_input').prop('disabled', true); $('.get-dir-btn').prop('disabled', true).css('opacity', '0.5');
          $('#search_trigger').css({'pointer-events': 'none', 'opacity': '0.5'});
       });
       
       Shiny.addCustomMessageHandler('end_nav_ui', function(msg) {
-         $('#nav_info_panel').removeClass('active'); 
-         $('#bottom_tray').removeClass('nav-active'); 
-         
-         $('#q_input, #start_input').prop('disabled', false).val('');
-         $('#start_input').val('Current Location');
-         $('.get-dir-btn').prop('disabled', false).css('opacity', '1');
-         $('#search_trigger').css({'pointer-events': 'auto', 'opacity': '1'});
+         $('#nav_info_panel').removeClass('active'); $('#bottom_tray').removeClass('nav-active'); 
+         $('#q_input, #start_input').prop('disabled', false).val(''); $('#start_input').val('Current Location');
+         $('.get-dir-btn').prop('disabled', false).css('opacity', '1'); $('#search_trigger').css({'pointer-events': 'auto', 'opacity': '1'});
       });
       
       Shiny.addCustomMessageHandler('update_risk_level', function(msg) {
          let level = msg.level; 
          $('#risk_btn').removeClass('risk-active risk-low risk-medium risk-high');
-         
-         if (level === 'Low') {
-           $('#risk_btn').addClass('risk-active risk-low');
-           $('#risk_text').text('Low');
-         } else if (level === 'Medium') {
-           $('#risk_btn').addClass('risk-active risk-medium');
-           $('#risk_text').text('Medium');
-         } else if (level === 'High') {
-           $('#risk_btn').addClass('risk-active risk-high');
-           $('#risk_text').text('High');
-         }
+         if (level === 'Low') { $('#risk_btn').addClass('risk-active risk-low'); $('#risk_text').text('Low'); } 
+         else if (level === 'Medium') { $('#risk_btn').addClass('risk-active risk-medium'); $('#risk_text').text('Medium'); } 
+         else if (level === 'High') { $('#risk_btn').addClass('risk-active risk-high'); $('#risk_text').text('High'); }
+      });
+
+      Shiny.addCustomMessageHandler('update_ai_advice', function(msg) {
+         $('#ai_advice_text').html(msg.text).css({ 'font-style': 'normal', 'color': '#000', 'text-align': 'left', 'line-height': '1.5' });
       });
     ")),
 
-    # --- 自定义 CSS ---
     tags$style(HTML("
       body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; overflow: hidden; }
       #fg-map { position: fixed; top: 0; bottom: 0; left: 0; right: 0; z-index: 1; }
@@ -271,7 +222,6 @@ ui <- f7Page(
       "))
   ),
 
-  # 顶层提示弹窗
   div(id = "fg-toast", class = "ios-toast", "Toast Message"),
 
   div(id = "fg-map", leafletOutput("map", height = "100%")),
@@ -279,7 +229,7 @@ ui <- f7Page(
 
   tags$button(
     id = "my_loc_btn", class = "action-button loc-btn", 
-    onclick = "Shiny.setInputValue('trigger_loc_btn', Math.random())",
+    onclick = "requestLocation(); Shiny.setInputValue('trigger_loc_btn', Math.random())",
     tags$span(class = "material-symbols-rounded", style="color: #007AFF; font-size: 26px;", "my_location")
   ),
 
@@ -289,7 +239,9 @@ ui <- f7Page(
       div(class = "ios-section-title", "LIVE MAP"),
       div(class = "ios-group", div(class = "ios-row no-click", div(class = "ios-row-title", "Risk Spot"), tags$label(class = "ios-switch", tags$input(id = "chk_risk_spot", type = "checkbox", onchange = "Shiny.setInputValue('show_heatmap', this.checked)"), tags$span(class = "ios-slider-toggle")))),
       div(class = "ios-section-title", "AI DRIVING ASSISTANT"),
-      div(class = "ios-group", div(style = "padding: 20px; min-height: 80px; display: flex; flex-direction: column; justify-content: center; align-items: center;", div(style = "color: #8E8E93; font-size: 15px; text-align: center; font-style: italic;", "AI Speed Recommendation will appear here...")))
+      div(class = "ios-group", div(style = "padding: 20px; min-height: 80px; display: flex; flex-direction: column; justify-content: center; align-items: flex-start;", 
+          div(id = "ai_advice_text", style = "color: #8E8E93; font-size: 15px; text-align: left; font-style: italic;", "AI Suggestion will appear here...")
+      ))
     )
   ),
 

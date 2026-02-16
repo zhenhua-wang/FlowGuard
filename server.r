@@ -8,12 +8,128 @@ library(sf)
 library(terra)
 library(lubridate)
 library(dplyr)
-
+library(httr) 
 
 # 导入底层模型与风险计算工具
 source("./lgcp_utils.r")
+
+# 1.1 获取实时天气 
+get_weather <- function(lat, lon) {
+  url <- sprintf("https://api.open-meteo.com/v1/forecast?latitude=%f&longitude=%f&current_weather=true", lat, lon)
+  res <- tryCatch({
+    req <- GET(url, timeout(3))
+    if (status_code(req) == 200) {
+      data <- fromJSON(content(req, "text", encoding = "UTF-8"))
+      code <- data$current_weather$weathercode
+      temp <- data$current_weather$temperature
+      
+      desc <- "Clear/Cloudy"
+      if (code %in% c(45,48)) desc <- "Fog"
+      if (code >= 51 && code <= 67) desc <- "Rain"
+      if (code >= 71 && code <= 86) desc <- "Snow"
+      if (code >= 95) desc <- "Thunderstorm"
+      
+      return(sprintf("%s, %.1f C", desc, temp))
+    }
+    return("Unknown Weather")
+  }, error = function(e) { return("Unknown Weather") })
+  return(res)
+}
+
+# 1.2 获取道路信息与限速 
+get_road_info <- function(lat, lon) {
+  url <- paste0("https://overpass-api.de/api/interpreter?data=[out:json];way(around:30,", lat, ",", lon, ")[\"highway\"];out tags;")
+  res <- tryCatch({
+    req <- GET(url, timeout(3))
+    if (status_code(req) == 200) {
+      data <- fromJSON(content(req, "text", encoding = "UTF-8"))
+      if (length(data$elements) > 0 && "tags" %in% names(data$elements)) {
+        tags <- data$elements$tags
+        maxspeed <- if ("maxspeed" %in% names(tags)) tags$maxspeed[1] else "Unknown"
+        road_name <- if ("name" %in% names(tags)) tags$name[1] else "Local Road"
+        return(sprintf("Road: %s, Speed Limit: %s", road_name, maxspeed))
+      }
+    }
+    return("Road Info: Unknown")
+  }, error = function(e) { return("Road Info: Unknown") })
+  return(res)
+}
+
+# 1.3 调用 Archia Agent 进行大模型推理
+call_archia_agent <- function(prompt_text) {
+  
+  # 用户专属 API 配置 
+  archia_api_key <- "ask_6aHeqetNVu285mInrck-QgybeJK14AcZGOQNlSlZ7XE=" 
+  archia_endpoint <- "https://registry.archia.app/v1/responses" 
+  agent_name <- "TrafficCopilot" 
+  
+  res <- tryCatch({
+    # 发起请求
+    req <- POST(
+      url = archia_endpoint,
+      add_headers(
+        Authorization = paste("Bearer", archia_api_key), 
+        `Content-Type` = "application/json"
+      ),
+      body = toJSON(list(
+        model = paste0("agent:", agent_name),
+        input = prompt_text
+      ), auto_unbox = TRUE),
+      timeout(8) # 增加超时时间，防止模型推理较慢
+    )
+    
+    resp_text <- content(req, "text", encoding = "UTF-8")
+    
+    # 1. HTTP 状态码校验
+    if (status_code(req) != 200) {
+       print(paste("Archia HTTP Error:", status_code(req)))
+       print(resp_text)
+       return("Risk: Unknown\nSpeed: N/A\nSuggestion: API Server Error.")
+    }
+    
+    data <- fromJSON(resp_text)
+    
+    # 2. Archia 专属 Payload 状态校验
+    if (!is.null(data$status)) {
+       if (data$status == "failed") {
+           err_msg <- if(!is.null(data$error$message)) data$error$message else "Unknown error"
+           print(paste("Archia Returned Failed Status:", err_msg))
+           return("Risk: Unknown\nSpeed: N/A\nSuggestion: Agent processing failed.")
+       } else if (data$status != "completed") {
+           print(paste("Archia Returned Unexpected Status:", data$status))
+           return("Risk: Unknown\nSpeed: N/A\nSuggestion: Agent status not completed.")
+       }
+    }
+    
+    # 3. 提取输出文本 (应对 jsonlite 解析的不同结构嵌套)
+    out_str <- NULL
+    if (!is.null(data$output)) {
+       if (is.data.frame(data$output) && length(data$output$content) > 0 && is.data.frame(data$output$content[[1]])) {
+           out_str <- data$output$content[[1]]$text[1]
+       } else if (is.list(data$output) && !is.null(data$output[[1]]$content[[1]]$text)) {
+           out_str <- data$output[[1]]$content[[1]]$text
+       }
+    }
+    
+    # 4. 安全拦截 NULL 值，防止外层 observe 崩溃
+    if (is.null(out_str) || is.na(out_str) || out_str == "") {
+      print("Failed to parse text. Raw JSON returned:")
+      print(resp_text)
+      return("Risk: Unknown\nSpeed: N/A\nSuggestion: Empty response from AI.")
+    }
+    
+    return(as.character(out_str))
+    
+  }, error = function(e) { 
+    print(paste("R Network Error:", e$message))
+    return("Risk: Unknown\nSpeed: N/A\nSuggestion: Network connection failed.") 
+  })
+  
+  return(res)
+}
+
 # ==========================================
-# 2. 外部调用的API辅助函数 
+# 3. 辅助服务与路由获取
 # ==========================================
 geocode_osm <- function(query) {
   safe_query <- URLencode(query)
@@ -41,22 +157,17 @@ get_osrm_route <- function(start_pt, end_pt) {
 }
 
 # ==========================================
-# 3. 后端 Server 逻辑
+# 4. 后端 Server 逻辑
 # ==========================================
 server <- function(input, output, session) {
-  # --- 参数配置 ---
-  # 将 current_location 设置为响应式变量，支持真实定位更新，保留 Columbia 作为默认回退坐标
+  
   current_location <- reactiveVal(c(lon = -92.3341, lat = 38.9517))
   current_date <- mdy("1/24/2021") 
   
-  high_risk_threshold <- 1.5   
-  mod_risk_threshold  <- 1.0   
-  mean_lambda <- 5.819679e-06
-  buffer_radius  <- 20     
+  # 【视觉升级】：放大基准半径，增强光晕警示效果
+  buffer_radius  <- 45     
   n_fade_rings   <- 10     
-  max_ring_alpha <- 0.35   
-  min_ring_alpha <- 0.00   
-
+  
   col_red    <- "#FF3B30"  
   col_yellow <- "#FFCC00"  
   col_green  <- "#34C759"  
@@ -64,13 +175,11 @@ server <- function(input, output, session) {
   model_epsg <- 26915
   model_crs  <- sf::st_crs(model_epsg)
 
-  # --- 监听前端传来的真实物理坐标 (Geolocation) ---
   observeEvent(input$user_location, {
     req(input$user_location)
     loc <- c(lon = as.numeric(input$user_location$lon), lat = as.numeric(input$user_location$lat))
     current_location(loc)
     
-    # 获取到真实位置后飞至该地点并更新中心标记
     leafletProxy("map") %>%
       setView(lng = loc["lon"], lat = loc["lat"], zoom = 15) %>%
       removeMarker(layerId = "current_loc") %>%
@@ -79,7 +188,6 @@ server <- function(input, output, session) {
                        fillOpacity = 1, layerId = "current_loc")
   })
 
-  # --- 动态数据追溯与模型防抖 ---
   date_lags_rv <- reactive({
     if (is.null(input$traffic_days)) return(15) 
     as.numeric(input$traffic_days)
@@ -101,7 +209,6 @@ server <- function(input, output, session) {
   is_navigating <- reactiveVal(FALSE)
   current_route_sf <- reactiveVal(NULL)
 
-  # 初始化地图 (使用 isolate 避免因 current_location 改变引发整个底图重绘)
   output$map <- renderLeaflet({
     loc <- isolate(current_location())
     leaflet(options = leafletOptions(zoomControl = FALSE)) %>%
@@ -112,33 +219,23 @@ server <- function(input, output, session) {
                        fillOpacity = 1, layerId = "current_loc")
   })
 
-  # --- 独立控制：Show Traffic Stops (具体事件红点散布) ---
   observeEvent(list(input$individual_case, dat_rv()), {
     map_proxy <- leafletProxy("map")
-    
     if (isTruthy(input$individual_case)) {
       req(dat_rv())
       pts_ll <- st_transform(st_as_sf(dat_rv(), coords = c("x", "y"), crs = model_crs), 4326)
-      
-      map_proxy %>%
-        clearGroup("traffic_events") %>%
-        addCircleMarkers(
-          data = pts_ll, group = "traffic_events",
-          radius = 3.5, stroke = FALSE,
-          fillOpacity = 0.6, fillColor = col_red
-        )
+      map_proxy %>% clearGroup("traffic_events") %>%
+        addCircleMarkers(data = pts_ll, group = "traffic_events", radius = 3.5, stroke = FALSE, fillOpacity = 0.6, fillColor = col_red)
     } else {
       map_proxy %>% clearGroup("traffic_events")
     }
   }, ignoreInit = FALSE)
 
-  # --- 面板交互与点击拦截逻辑 ---
   observeEvent(input$map_click, {
     if (is_navigating()) {
       shinyjs::runjs("showToast('Please END navigation to select a new location.');")
       return()
     }
-    
     click <- input$map_click; req(click)
     url <- sprintf("https://nominatim.openstreetmap.org/reverse?format=json&lat=%f&lon=%f", click$lat, click$lng)
     req_data <- tryCatch(jsonlite::fromJSON(url), error = function(e) NULL)
@@ -147,15 +244,10 @@ server <- function(input, output, session) {
       dest_name <- trimws(strsplit(req_data$display_name, ",")[[1]][1]); dest_name <- gsub("'", "", dest_name)
     }
     
-    leafletProxy("map") %>% 
-      clearGroup("search_res") %>% 
-      setView(lng = click$lng, lat = click$lat, zoom = 15) %>%
+    leafletProxy("map") %>% clearGroup("search_res") %>% setView(lng = click$lng, lat = click$lat, zoom = 15) %>%
       addCircleMarkers(lng = click$lng, lat = click$lat, group = "search_res", radius = 10, color = "#fff", weight = 3, fillColor = "#FF3B30", fillOpacity = 1, label = dest_name, labelOptions = labelOptions(noHide = TRUE, textOnly = TRUE, className = "ios-map-label", direction = "top", offset = c(0, -10)))
     
-    js_code <- sprintf("
-      $('#q_input').val('%s'); $('#q_input').attr('data-clicked-lat', %f); $('#q_input').attr('data-clicked-lon', %f);
-      $('#search_panel').addClass('active'); $('#global_overlay').addClass('active'); $('#bottom_tray').addClass('panel-open'); $('#risk_btn').addClass('panel-open'); $('.loc-btn').addClass('panel-open');
-    ", dest_name, click$lat, click$lng)
+    js_code <- sprintf("$('#q_input').val('%s'); $('#q_input').attr('data-clicked-lat', %f); $('#q_input').attr('data-clicked-lon', %f); $('#search_panel').addClass('active'); $('#global_overlay').addClass('active'); $('#bottom_tray').addClass('panel-open'); $('#risk_btn').addClass('panel-open'); $('.loc-btn').addClass('panel-open');", dest_name, click$lat, click$lng)
     shinyjs::runjs(js_code)
   })
 
@@ -225,19 +317,16 @@ server <- function(input, output, session) {
     
     if (!is.null(route_data)) {
       is_navigating(TRUE) 
-      
       map_proxy %>% addPolylines(lng = route_data$coords[,1], lat = route_data$coords[,2], color = "#007AFF", weight = 6, opacity = 0.8, group = "search_res") %>%
         fitBounds(lng1 = min(start_loc["lon"], dest_loc["lon"]), lat1 = min(start_loc["lat"], dest_loc["lat"]), lng2 = max(start_loc["lon"], dest_loc["lon"]), lat2 = max(start_loc["lat"], dest_loc["lat"]))
       
       session$sendCustomMessage("start_nav_ui", list(dist = round(route_data$dist / 1609.34, 1), time = max(1, round(route_data$time / 60))))
-      
       shinyjs::runjs("$('#chk_risk_spot').prop('checked', true); Shiny.setInputValue('show_heatmap', true);")
       
       rc <- data.frame(lng = route_data$coords[,1], lat = route_data$coords[,2])
       ln_ll <- st_sfc(st_linestring(as.matrix(rc[, c("lng", "lat")])), crs = 4326)
       ln_m <- st_transform(ln_ll, model_crs)
       current_route_sf(ln_m) 
-      
     } else {
       shinyjs::runjs("alert('Could not generate driving route between these locations.');")
       map_proxy %>% setView(lng = dest_loc["lon"], lat = dest_loc["lat"], zoom = 15)
@@ -245,19 +334,19 @@ server <- function(input, output, session) {
   })
 
   # =================================================================================
-  # 核心渲染与状态更新 (受 Risk Spot 控制的波纹和光晕，加入当前坐标跟踪)
+  # 核心渲染与状态更新
   # =================================================================================
   observeEvent(list(input$show_heatmap, current_route_sf(), pp_rv(), current_location()), {
     if (is.null(input$show_heatmap) || !input$show_heatmap) {
       session$sendCustomMessage("update_risk_level", list(level = "Off"))
-      leafletProxy("map") %>% 
-        clearGroup("risk_halos") %>% 
-        clearGroup("current_risk_halo")
+      session$sendCustomMessage("update_ai_advice", list(text = "AI Suggestion will appear here..."))
+      leafletProxy("map") %>% clearGroup("risk_halos") %>% clearGroup("current_risk_halo")
       return()
     }
     
     req(pp_rv())
     map_proxy <- leafletProxy("map")
+    session$sendCustomMessage("update_ai_advice", list(text = "Archia is analyzing environment context..."))
     
     loc <- current_location()
     curr_pt <- st_sfc(st_point(c(loc["lon"], loc["lat"])), crs=4326) %>% st_transform(model_crs)
@@ -266,12 +355,7 @@ server <- function(input, output, session) {
       road_m <- current_route_sf()
       bb_route <- st_bbox(st_buffer(road_m, dist = buffer_radius + 10))
       bb_curr <- st_bbox(st_buffer(curr_pt, 500))
-      bb <- c(
-        xmin = min(bb_route["xmin"], bb_curr["xmin"]),
-        ymin = min(bb_route["ymin"], bb_curr["ymin"]),
-        xmax = max(bb_route["xmax"], bb_curr["xmax"]),
-        ymax = max(bb_route["ymax"], bb_curr["ymax"])
-      )
+      bb <- c(xmin = min(bb_route["xmin"], bb_curr["xmin"]), ymin = min(bb_route["ymin"], bb_curr["ymin"]), xmax = max(bb_route["xmax"], bb_curr["xmax"]), ymax = max(bb_route["ymax"], bb_curr["ymax"]))
     } else {
       bb <- st_bbox(st_buffer(curr_pt, 500))
     }
@@ -279,65 +363,106 @@ server <- function(input, output, session) {
     pred <- predict_lgcp(pp_rv(), xmin = as.numeric(bb["xmin"]), xmax = as.numeric(bb["xmax"]), ymin = as.numeric(bb["ymin"]), ymax = as.numeric(bb["ymax"]), npred = 200)
     r_m <- terra::rast(pred[, c("x", "y", "p")], type = "xyz")
     terra::crs(r_m) <- model_crs$wkt
-    rr_m <- r_m / mean_lambda
     
-    curr_rr <- terra::extract(rr_m, terra::vect(curr_pt))[, 2]
+    curr_rr_raw <- terra::extract(r_m, terra::vect(curr_pt))
+    curr_raw_val <- 0.0
+    if (!is.null(curr_rr_raw) && nrow(curr_rr_raw) > 0) {
+       val <- curr_rr_raw[1, 2]
+       if (!is.na(val)) curr_raw_val <- val
+    }
     
-    if (is.na(curr_rr)) curr_level <- "Low"
-    else if (curr_rr > high_risk_threshold) curr_level <- "High"
-    else if (curr_rr > mod_risk_threshold) curr_level <- "Medium"
-    else curr_level <- "Low"
+    current_time_str <- format(Sys.time(), "%I:%M %p")
+    weather_cond <- get_weather(loc["lat"], loc["lon"])
+    road_info <- get_road_info(loc["lat"], loc["lon"])
     
-    session$sendCustomMessage("update_risk_level", list(level = curr_level))
+    agent_input <- sprintf(
+      "System Input:\n- Raw Spatial Risk Score: %e\n- Location: [%f, %f]\n- Current Time: %s\n- Weather: %s\n- %s\n\nTask: Evaluate driving risk. Output EXACTLY 3 lines:\nRisk: [Low/Medium/High]\nSpeed: [X mph]\nSuggestion: [1 brief sentence]",
+      curr_raw_val, loc["lat"], loc["lon"], current_time_str, weather_cond, road_info
+    )
     
-    curr_color <- if (curr_level == "High") col_red else if (curr_level == "Medium") col_yellow else col_green
+    ai_response <- call_archia_agent(agent_input)
     
+    if (length(ai_response) == 0 || is.na(ai_response) || is.null(ai_response)) {
+      ai_response <- "Risk: Unknown\nSpeed: N/A\nSuggestion: Unrecognized Agent output."
+    }
+    ai_response <- paste(ai_response, collapse = "\n")
+    
+    parsed_level <- "Low"
+    if (is.character(ai_response) && length(ai_response) > 0) {
+      if (grepl("Risk:\\s*High", ai_response, ignore.case = TRUE)) parsed_level <- "High"
+      else if (grepl("Risk:\\s*Medium", ai_response, ignore.case = TRUE)) parsed_level <- "Medium"
+    }
+    
+    ui_text <- gsub("\\*\\*(?i)Risk:\\*\\*|(?i)Risk:", "<b>Risk:</b>", ai_response)
+    ui_text <- gsub("\\*\\*(?i)Speed:\\*\\*|(?i)Speed:", "<b>Speed:</b>", ui_text)
+    ui_text <- gsub("\\*\\*(?i)Suggestion:\\*\\*|(?i)Suggestion:|\\*\\*(?i)Advice:\\*\\*|(?i)Advice:", "<b>Suggestion:</b>", ui_text)
+    ui_text <- gsub("\\n", "<br/>", ui_text)
+    
+    session$sendCustomMessage("update_ai_advice", list(text = ui_text))
+    session$sendCustomMessage("update_risk_level", list(level = parsed_level))
+    
+    curr_color <- if (parsed_level == "High") col_red else if (parsed_level == "Medium") col_yellow else col_green
+    
+    # -------------------------------------------------------------
+    # 【视觉优化】：提升透明度，放大同心圆扩散半径
+    # -------------------------------------------------------------
     map_proxy %>% clearGroup("current_risk_halo")
-    spot_radius <- buffer_radius 
-    radii_curr <- seq(spot_radius, 1, length.out = n_fade_rings)
-    alpha_step_curr <- 1.0 / n_fade_rings 
+    radii_curr <- seq(buffer_radius, 1, length.out = n_fade_rings)
     
+    # 提高单层透明度，让中心更浓郁实色 (1.5 / n_fade_rings)
+    alpha_step_curr <- 1.5 / n_fade_rings 
     for (j in seq_len(n_fade_rings)) {
       map_proxy %>% addCircles(
-        lng = loc["lon"], lat = loc["lat"],
-        radius = radii_curr[j], group = "current_risk_halo", stroke = FALSE, fill = TRUE,
-        fillColor = curr_color, fillOpacity = alpha_step_curr, options = pathOptions(clickable = FALSE)
+        lng = loc["lon"], lat = loc["lat"], radius = radii_curr[j], group = "current_risk_halo", 
+        stroke = FALSE, fill = TRUE, fillColor = curr_color, fillOpacity = alpha_step_curr, options = pathOptions(clickable = FALSE)
       )
     }
 
+    # 路线光晕处理 (向量化高亮渲染)
     map_proxy %>% clearGroup("risk_halos")
-    
     if (is_navigating() && !is.null(current_route_sf())) {
-      road_linestring <- st_cast(road_m, "LINESTRING")
-      sample_pts_m <- st_line_sample(road_m, density = 1/30) 
-      sample_pts_sf <- st_as_sf(st_cast(sample_pts_m, "POINT"))
-      extracted_rr <- terra::extract(rr_m, terra::vect(sample_pts_sf))
-      pts_ll <- st_transform(sample_pts_sf, 4326)
-      coords <- st_coordinates(pts_ll)
+      sample_pts_m <- tryCatch({
+        st_line_sample(road_m, density = 1/30)
+      }, error = function(e) NULL)
       
-      radii  <- seq(1, buffer_radius, length.out = n_fade_rings)
-      alphas <- seq(max_ring_alpha, min_ring_alpha, length.out = n_fade_rings)
-
-      risk_data <- data.frame(lng = coords[, 1], lat = coords[, 2], rr = extracted_rr[, 2]) %>%
-        filter(!is.na(rr) & rr > mod_risk_threshold) 
-
-      for (i in seq_len(nrow(risk_data))) {
-        p_lng <- risk_data$lng[i]
-        p_lat <- risk_data$lat[i]
-        p_rr  <- risk_data$rr[i]
+      if (!is.null(sample_pts_m) && length(sample_pts_m) > 0) {
+        sample_pts_sf <- st_as_sf(st_cast(sample_pts_m, "POINT"))
+        extracted_raw <- terra::extract(r_m, terra::vect(sample_pts_sf))[,2]
         
-        is_high <- p_rr > high_risk_threshold
-        p_color <- if (is_high) col_red else col_yellow
-        
-        for (j in seq_len(n_fade_rings)) {
-          if (alphas[j] <= 0) next
-          map_proxy %>% addCircles(
-            lng = p_lng, lat = p_lat, radius = radii[j], group = "risk_halos", 
-            stroke = FALSE, fill = TRUE, fillColor = p_color, fillOpacity = alphas[j]
-          )
+        valid_raw <- extracted_raw[!is.na(extracted_raw)]
+        if (length(valid_raw) > 0) {
+          min_r <- min(valid_raw, na.rm=TRUE)
+          max_r <- max(valid_raw, na.rm=TRUE)
+          range_r <- max_r - min_r
+          if(range_r == 0) range_r <- 1e-9
+          
+          norm_rr <- (extracted_raw - min_r) / range_r
+          pts_ll <- st_transform(sample_pts_sf, 4326)
+          coords <- st_coordinates(pts_ll)
+          
+          risk_data <- data.frame(lng = coords[, 1], lat = coords[, 2], norm_val = norm_rr) %>% 
+            filter(!is.na(norm_val) & norm_val > 0.4) %>%
+            mutate(color = ifelse(norm_val > 0.75, col_red, col_yellow))
+
+          # 路径专属光晕参数：比当前位置圆稍小，透明度高亮加倍
+          route_buffer_radius <- buffer_radius * 0.75  
+          radii_route <- seq(route_buffer_radius, 1, length.out = n_fade_rings)
+          
+          # 提升路线高亮可见度 (1.0 / n_fade_rings)
+          alpha_step_route <- 1.0 / n_fade_rings  
+          
+          for (j in seq_len(n_fade_rings)) {
+            map_proxy %>% addCircles(
+              lng = risk_data$lng, lat = risk_data$lat, 
+              radius = radii_route[j], group = "risk_halos", 
+              stroke = FALSE, fill = TRUE, 
+              fillColor = risk_data$color, 
+              fillOpacity = alpha_step_route, 
+              options = pathOptions(clickable = FALSE)
+            )
+          }
         }
       }
     }
-    
   }, ignoreInit = TRUE)
 }
