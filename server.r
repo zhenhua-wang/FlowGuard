@@ -9,9 +9,9 @@ library(terra)
 library(lubridate)
 library(dplyr)
 
+
 # 导入底层模型与风险计算工具
 source("./lgcp_utils.r")
-
 # ==========================================
 # 2. 外部调用的API辅助函数 
 # ==========================================
@@ -45,7 +45,8 @@ get_osrm_route <- function(start_pt, end_pt) {
 # ==========================================
 server <- function(input, output, session) {
   # --- 参数配置 ---
-  current_location <- c(lon = -92.3341, lat = 38.9517)
+  # 将 current_location 设置为响应式变量，支持真实定位更新，保留 Columbia 作为默认回退坐标
+  current_location <- reactiveVal(c(lon = -92.3341, lat = 38.9517))
   current_date <- mdy("1/24/2021") 
   
   high_risk_threshold <- 1.5   
@@ -62,6 +63,21 @@ server <- function(input, output, session) {
 
   model_epsg <- 26915
   model_crs  <- sf::st_crs(model_epsg)
+
+  # --- 监听前端传来的真实物理坐标 (Geolocation) ---
+  observeEvent(input$user_location, {
+    req(input$user_location)
+    loc <- c(lon = as.numeric(input$user_location$lon), lat = as.numeric(input$user_location$lat))
+    current_location(loc)
+    
+    # 获取到真实位置后飞至该地点并更新中心标记
+    leafletProxy("map") %>%
+      setView(lng = loc["lon"], lat = loc["lat"], zoom = 15) %>%
+      removeMarker(layerId = "current_loc") %>%
+      addCircleMarkers(lng = loc["lon"], lat = loc["lat"],
+                       radius = 10, color = "#fff", weight = 3, fillColor = "#007AFF",
+                       fillOpacity = 1, layerId = "current_loc")
+  })
 
   # --- 动态数据追溯与模型防抖 ---
   date_lags_rv <- reactive({
@@ -85,11 +101,13 @@ server <- function(input, output, session) {
   is_navigating <- reactiveVal(FALSE)
   current_route_sf <- reactiveVal(NULL)
 
+  # 初始化地图 (使用 isolate 避免因 current_location 改变引发整个底图重绘)
   output$map <- renderLeaflet({
+    loc <- isolate(current_location())
     leaflet(options = leafletOptions(zoomControl = FALSE)) %>%
       addTiles() %>%
-      setView(lng = current_location["lon"], lat = current_location["lat"], zoom = 14) %>%
-      addCircleMarkers(lng = current_location["lon"], lat = current_location["lat"], 
+      setView(lng = loc["lon"], lat = loc["lat"], zoom = 14) %>%
+      addCircleMarkers(lng = loc["lon"], lat = loc["lat"], 
                        radius = 10, color = "#fff", weight = 3, fillColor = "#007AFF", 
                        fillOpacity = 1, layerId = "current_loc")
   })
@@ -152,12 +170,16 @@ server <- function(input, output, session) {
     shinyjs::runjs("setTimeout(hideSubViews, 300);")
   }, ignoreInit = TRUE)
   
-  observeEvent(input$trigger_loc_btn, { leafletProxy("map") %>% setView(lng = current_location["lon"], lat = current_location["lat"], zoom = 15) })
+  observeEvent(input$trigger_loc_btn, { 
+    loc <- current_location()
+    leafletProxy("map") %>% setView(lng = loc["lon"], lat = loc["lat"], zoom = 15) 
+  })
   
   observeEvent(input$trigger_end_nav, {
     is_navigating(FALSE)
     current_route_sf(NULL) 
-    leafletProxy("map") %>% clearGroup("search_res") %>% clearGroup("risk_halos") %>% setView(lng = current_location["lon"], lat = current_location["lat"], zoom = 14)
+    loc <- current_location()
+    leafletProxy("map") %>% clearGroup("search_res") %>% clearGroup("risk_halos") %>% setView(lng = loc["lon"], lat = loc["lat"], zoom = 14)
     session$sendCustomMessage("end_nav_ui", list())
   })
   
@@ -178,10 +200,10 @@ server <- function(input, output, session) {
     
     start_loc <- NULL
     if (tolower(start_str) %in% c("current location", "my location", "")) {
-      start_loc <- current_location; start_name <- "Current Location"
+      start_loc <- current_location(); start_name <- "Current Location"
     } else {
       start_loc <- geocode_osm(start_str); start_name <- start_str
-      if (is.null(start_loc)) { start_loc <- current_location; start_name <- "Current Location" }
+      if (is.null(start_loc)) { start_loc <- current_location(); start_name <- "Current Location" }
     }
     
     dest_loc <- NULL
@@ -196,7 +218,10 @@ server <- function(input, output, session) {
     map_proxy <- leafletProxy("map") %>% clearGroup("search_res") %>% clearGroup("risk_halos")
     
     map_proxy %>% addCircleMarkers(lng = dest_loc["lon"], lat = dest_loc["lat"], group = "search_res", radius = 10, color = "#fff", weight = 3, fillColor = "#FF3B30", fillOpacity = 1, label = end_str, labelOptions = labelOptions(noHide = TRUE, textOnly = TRUE, className = "ios-map-label", direction = "top", offset = c(0, -10)))
-    if (!identical(start_loc, current_location)) { map_proxy %>% addCircleMarkers(lng = start_loc["lon"], lat = start_loc["lat"], group = "search_res", radius = 10, color = "#fff", weight = 3, fillColor = "#007AFF", fillOpacity = 1, label = start_name, labelOptions = labelOptions(noHide = TRUE, textOnly = TRUE, className = "ios-map-label", direction = "top", offset = c(0, -10))) }
+    
+    if (!identical(start_loc, current_location())) { 
+      map_proxy %>% addCircleMarkers(lng = start_loc["lon"], lat = start_loc["lat"], group = "search_res", radius = 10, color = "#fff", weight = 3, fillColor = "#007AFF", fillOpacity = 1, label = start_name, labelOptions = labelOptions(noHide = TRUE, textOnly = TRUE, className = "ios-map-label", direction = "top", offset = c(0, -10))) 
+    }
     
     if (!is.null(route_data)) {
       is_navigating(TRUE) 
@@ -220,9 +245,9 @@ server <- function(input, output, session) {
   })
 
   # =================================================================================
-  # 核心渲染与状态更新 (控制 Risk Spot 的波纹和路线管状光晕，不再带有任何散点)
+  # 核心渲染与状态更新 (受 Risk Spot 控制的波纹和光晕，加入当前坐标跟踪)
   # =================================================================================
-  observeEvent(list(input$show_heatmap, current_route_sf(), pp_rv()), {
+  observeEvent(list(input$show_heatmap, current_route_sf(), pp_rv(), current_location()), {
     if (is.null(input$show_heatmap) || !input$show_heatmap) {
       session$sendCustomMessage("update_risk_level", list(level = "Off"))
       leafletProxy("map") %>% 
@@ -234,7 +259,8 @@ server <- function(input, output, session) {
     req(pp_rv())
     map_proxy <- leafletProxy("map")
     
-    curr_pt <- st_sfc(st_point(c(current_location["lon"], current_location["lat"])), crs=4326) %>% st_transform(model_crs)
+    loc <- current_location()
+    curr_pt <- st_sfc(st_point(c(loc["lon"], loc["lat"])), crs=4326) %>% st_transform(model_crs)
     
     if (is_navigating() && !is.null(current_route_sf())) {
       road_m <- current_route_sf()
@@ -273,7 +299,7 @@ server <- function(input, output, session) {
     
     for (j in seq_len(n_fade_rings)) {
       map_proxy %>% addCircles(
-        lng = current_location["lon"], lat = current_location["lat"],
+        lng = loc["lon"], lat = loc["lat"],
         radius = radii_curr[j], group = "current_risk_halo", stroke = FALSE, fill = TRUE,
         fillColor = curr_color, fillOpacity = alpha_step_curr, options = pathOptions(clickable = FALSE)
       )

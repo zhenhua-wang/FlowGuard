@@ -105,6 +105,24 @@ ui <- f7Page(
             triggerCustomRoute(); $(this).blur();
           }
         });
+
+        // =====================================================================
+        // 调用浏览器原生 Geolocation API 获取实时物理定位
+        // =====================================================================
+        if (\"geolocation\" in navigator) {
+          navigator.geolocation.getCurrentPosition(function(position) {
+            Shiny.setInputValue(\"user_location\", {
+              lat: position.coords.latitude,
+              lon: position.coords.longitude,
+              rand: Math.random()
+            });
+          }, function(error) {
+            console.warn(\"Geolocation failed: \" + error.message);
+            showToast(\"Using default location. Enable GPS for real-time location.\");
+          }, { enableHighAccuracy: true, timeout: 10000 });
+        } else {
+          showToast(\"Geolocation is not supported by your browser.\");
+        }
       });
       
       function showToast(msg) {
