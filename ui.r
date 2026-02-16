@@ -1,12 +1,9 @@
-# ==========================================
-# ui.r - 前端界面设计
-# ==========================================
 library(shiny)
 library(shinyMobile)
 library(leaflet)
 library(shinyjs)
 
-ui <- f7Page(
+f7Page(
   title = "FlowGuard",
   options = list(theme = "auto", dark = FALSE, filled = FALSE),
   
@@ -37,12 +34,17 @@ ui <- f7Page(
         Shiny.setInputValue('fly_to_loc', {lat: lat, lon: lon, name: shortName, type: activeInputId, rand: Math.random()});
       }
       
+      // 【核心修改】：通过纯 JS 收起面板，不触发 R 后端的 close_all，保证终点不会被清空
       function triggerCustomRoute() {
         let start_val = $('#start_input').val().trim(); let end_val = $('#q_input').val().trim();
         let click_lat = $('#q_input').attr('data-clicked-lat'); let click_lon = $('#q_input').attr('data-clicked-lon');
         if(end_val === '') { alert('Please enter a destination.'); return; }
         
-        Shiny.setInputValue('close_all', Math.random());
+        // 直接操作 DOM 隐藏所有面板
+        $('.ios-panel, #global_overlay').removeClass('active');
+        $('.fg-bottombar, .loc-btn, .risk-indicator, .view-capsule').removeClass('panel-open');
+        setTimeout(hideSubViews, 300);
+        
         Shiny.setInputValue('do_custom_route', {
           start: start_val, end: end_val, dest_lat: click_lat ? parseFloat(click_lat) : null, dest_lon: click_lon ? parseFloat(click_lon) : null, rand: Math.random()
         });
