@@ -3,8 +3,14 @@ library(shinyMobile)
 library(leaflet)
 library(leaflet.extras)
 library(shinyjs)
+library(jsonlite)
+library(sf)
+library(terra)
+library(lubridate)
+library(dplyr)
+
 # ==========================================
-# 1. 前端 UI 设计 (本地搜索偏好 + iOS按压动画版)
+# 1. 前端 UI 设计 
 # ==========================================
 ui <- f7Page(
   title = "FlowGuard",
@@ -66,19 +72,14 @@ ui <- f7Page(
 
       $(document).ready(function() {
         let timeout = null;
-        
         $(document).on('focus input', '#start_input, #q_input', function() {
           activeInputId = $(this).attr('id'); 
-          
           if (activeInputId === 'q_input') {
-             $(this).removeAttr('data-clicked-lat');
-             $(this).removeAttr('data-clicked-lon');
+             $(this).removeAttr('data-clicked-lat'); $(this).removeAttr('data-clicked-lon');
           }
-          
           clearTimeout(timeout);
           let query = $(this).val().trim();
           if (query.length < 2) { $('#search_suggestions').empty().removeClass('active'); return; }
-          
           timeout = setTimeout(function() {
              let viewbox = '-93.0,39.5,-91.5,38.0'; 
              fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&format=json&limit=5&viewbox=${viewbox}`)
@@ -89,10 +90,7 @@ ui <- f7Page(
                    let shortName = item.display_name.split(',')[0];
                    html += `
                      <div class=\"suggestion-item\" data-lat=\"${item.lat}\" data-lon=\"${item.lon}\" data-short=\"${shortName.replace(/\"/g, '&quot;')}\" onclick=\"handleSuggestClick(this)\">
-                        <div class=\"suggestion-text\">
-                           <div class=\"sugg-title\">${shortName}</div>
-                           <div class=\"sugg-sub\">${item.display_name}</div>
-                        </div>
+                        <div class=\"suggestion-text\"><div class=\"sugg-title\">${shortName}</div><div class=\"sugg-sub\">${item.display_name}</div></div>
                      </div>
                    `;
                 });
@@ -104,34 +102,39 @@ ui <- f7Page(
         
         $(document).on('keyup', '#q_input, #start_input', function(e) {
           if(e.key === 'Enter' || e.keyCode === 13) {
-            triggerCustomRoute();
-            $(this).blur();
+            triggerCustomRoute(); $(this).blur();
           }
         });
       });
+      
+      function showToast(msg) {
+        $('#fg-toast').text(msg).addClass('show');
+        setTimeout(function() { $('#fg-toast').removeClass('show'); }, 3000);
+      }
 
-      // --- 【更新：状态解耦的 JS 通讯，支持 Medium 字符】 ---
       Shiny.addCustomMessageHandler('start_nav_ui', function(msg) {
          $('#nav_time').text(msg.time + ' min');
          $('#nav_dist').text(msg.dist + ' mi');
          $('#bottom_tray').addClass('nav-active');   
          $('#nav_info_panel').addClass('active');    
          
-         // 导航开始时拉宽并设为 Low
-         $('#risk_btn').removeClass('risk-medium risk-high').addClass('risk-active risk-low');
-         $('#risk_text').text('Low');
+         $('#q_input, #start_input').prop('disabled', true);
+         $('.get-dir-btn').prop('disabled', true).css('opacity', '0.5');
+         $('#search_trigger').css({'pointer-events': 'none', 'opacity': '0.5'});
       });
       
       Shiny.addCustomMessageHandler('end_nav_ui', function(msg) {
          $('#nav_info_panel').removeClass('active'); 
          $('#bottom_tray').removeClass('nav-active'); 
          
-         // 导航结束时恢复原状（无光、无字、纯圆）
-         $('#risk_btn').removeClass('risk-active risk-low risk-medium risk-high');
+         $('#q_input, #start_input').prop('disabled', false).val('');
+         $('#start_input').val('Current Location');
+         $('.get-dir-btn').prop('disabled', false).css('opacity', '1');
+         $('#search_trigger').css({'pointer-events': 'auto', 'opacity': '1'});
       });
       
       Shiny.addCustomMessageHandler('update_risk_level', function(msg) {
-         let level = msg.level; // 'Low', 'Medium', 'High', 'Off'
+         let level = msg.level; 
          $('#risk_btn').removeClass('risk-active risk-low risk-medium risk-high');
          
          if (level === 'Low') {
@@ -144,7 +147,6 @@ ui <- f7Page(
            $('#risk_btn').addClass('risk-active risk-high');
            $('#risk_text').text('High');
          }
-         // 如果是 Off，就什么类都不加，自动恢复原样
       });
     ")),
 
@@ -152,59 +154,28 @@ ui <- f7Page(
     tags$style(HTML("
       body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; overflow: hidden; }
       #fg-map { position: fixed; top: 0; bottom: 0; left: 0; right: 0; z-index: 1; }
-
-      :root {
-        --ios-glass-bg: rgba(255, 255, 255, 0.45); 
-        --ios-glass-blur: blur(35px) saturate(190%);
-        --ios-glass-border: 1px solid rgba(255, 255, 255, 0.5); 
-        --ios-glass-shadow: 0 10px 30px rgba(0,0,0,0.15);
-      }
-
-      .material-symbols-rounded { 
-        font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24; 
-        font-size: 28px; display: flex; align-items: center; justify-content: center; 
-        transition: color 0.4s ease;
-      }
-      
-      /* 默认情况下的图标颜色 */
+      :root { --ios-glass-bg: rgba(255, 255, 255, 0.45); --ios-glass-blur: blur(35px) saturate(190%); --ios-glass-border: 1px solid rgba(255, 255, 255, 0.5); --ios-glass-shadow: 0 10px 30px rgba(0,0,0,0.15); }
+      .material-symbols-rounded { font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24; font-size: 28px; display: flex; align-items: center; justify-content: center; transition: color 0.4s ease; }
       .risk-indicator .material-symbols-rounded { color: #000; }
-
-      .ios-panel { 
-        position: fixed; z-index: 10001; background: var(--ios-glass-bg) !important; 
-        backdrop-filter: var(--ios-glass-blur); -webkit-backdrop-filter: var(--ios-glass-blur); 
-        border: var(--ios-glass-border); box-shadow: 0 25px 50px rgba(0,0,0,0.2); 
-        opacity: 0; pointer-events: none; 
-        transition: transform 0.4s cubic-bezier(0.19, 1, 0.22, 1), opacity 0.4s ease; 
-        padding: 26px; box-sizing: border-box; display: flex; flex-direction: column; backface-visibility: hidden; 
-      }
+      .ios-panel { position: fixed; z-index: 10001; background: var(--ios-glass-bg) !important; backdrop-filter: var(--ios-glass-blur); -webkit-backdrop-filter: var(--ios-glass-blur); border: var(--ios-glass-border); box-shadow: 0 25px 50px rgba(0,0,0,0.2); opacity: 0; pointer-events: none; transition: transform 0.4s cubic-bezier(0.19, 1, 0.22, 1), opacity 0.4s ease; padding: 26px; box-sizing: border-box; display: flex; flex-direction: column; backface-visibility: hidden; }
       .ios-panel.active { opacity: 1; pointer-events: auto; }
-      
       .panel-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 22px; }
       .panel-title { font-size: 24px; font-weight: 800; color: #000; margin: 0; }
-      .panel-close-btn { 
-        background: rgba(0,0,0,0.06) !important; border: none; width: 30px; height: 30px; 
-        border-radius: 50%; color: #555; font-size: 22px; display: flex; align-items: center; 
-        justify-content: center; cursor: pointer; transform: translateZ(0); outline: none !important; 
-      }
-      
+      .panel-close-btn { background: rgba(0,0,0,0.06) !important; border: none; width: 30px; height: 30px; border-radius: 50%; color: #555; font-size: 22px; display: flex; align-items: center; justify-content: center; cursor: pointer; transform: translateZ(0); outline: none !important; }
       #risk_panel { top: 16px; left: 12px; right: 12px; height: 45vh; border-radius: 28px; transform-origin: 23px 23px; transform: scale(0); padding: 0; overflow: hidden;}
       #risk_panel.active { transform: scale(1); }
       #settings_panel { top: 85px; bottom: 12px; left: 12px; right: 12px; border-radius: 30px; transform: translateY(100%) scale(0.9); padding: 0; overflow: hidden; }
       #settings_panel.active { transform: translateY(0) scale(1); }
-      
       #search_panel { bottom: 90px; left: 12px; right: 12px; border-radius: 28px; transform: translateY(100vh); opacity: 1 !important; transition: transform 0.4s cubic-bezier(0.19, 1, 0.22, 1) !important; }
       #search_panel.active { transform: translateY(0); }
-
       .settings-view { position: absolute; top: 0; left: 0; right: 0; bottom: 0; padding: 26px 16px; box-sizing: border-box; overflow-y: auto; background: transparent; transition: transform 0.4s cubic-bezier(0.36, 0.66, 0.04, 1), opacity 0.4s ease; }
       #settings_main { transform: translateX(0); opacity: 1; }
       #settings_main.hidden-left { transform: translateX(-30%); opacity: 0; pointer-events: none; }
       .settings-subview { transform: translateX(100%); opacity: 0; pointer-events: none; }
       .settings-subview.active { transform: translateX(0); opacity: 1; pointer-events: auto; }
-
       .subview-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; position: relative; }
       .subview-header .back-btn { background: none; border: none; color: #007AFF; font-size: 17px; display: flex; align-items: center; padding: 0; cursor: pointer; }
       .subview-header .subview-title { font-size: 17px; font-weight: 600; color: #000; margin: 0; position: absolute; left: 50%; transform: translateX(-50%); pointer-events: none; }
-
       .ios-section-title { font-size: 13px; color: #6D6D72; margin: 16px 0 8px 16px; text-transform: uppercase; }
       .ios-group { background: rgba(255, 255, 255, 0.65); border-radius: 12px; margin-bottom: 24px; overflow: hidden; box-shadow: 0 1px 4px rgba(0,0,0,0.05); }
       .ios-row { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; min-height: 44px; border-bottom: 0.5px solid rgba(0,0,0,0.1); cursor: pointer; position: relative; }
@@ -214,7 +185,6 @@ ui <- f7Page(
       .ios-chevron { color: #C7C7CC; font-size: 20px; font-weight: bold; margin-bottom: 2px;}
       .ios-checkmark { color: #007AFF; font-size: 20px; font-weight: bold; display: none; }
       .ios-row.selected .ios-checkmark { display: block; }
-
       .slider-row { padding: 14px 16px; display: flex; align-items: center; gap: 14px; }
       .slider-label { font-size: 15px; color: #8E8E93; font-weight: 500; }
       .slider-container { position: relative; flex-grow: 1; display: flex; align-items: center; }
@@ -224,122 +194,49 @@ ui <- f7Page(
       input[type=range].ios-slider { width: 100%; -webkit-appearance: none; background: transparent; height: 30px; --value: 48.27%; }
       input[type=range].ios-slider::-webkit-slider-thumb { -webkit-appearance: none; height: 26px; width: 26px; border-radius: 50%; background: #fff; box-shadow: 0 1px 5px rgba(0,0,0,0.3); cursor: pointer; margin-top: -11px; }
       input[type=range].ios-slider::-webkit-slider-runnable-track { width: 100%; height: 4px; border-radius: 2px; background: linear-gradient(to right, #34c759 0%, #34c759 var(--value), #D1D1D6 var(--value), #D1D1D6 100%); }
-
       .ios-switch { position: relative; display: inline-block; width: 51px; height: 31px; }
       .ios-switch input { opacity: 0; width: 0; height: 0; }
       .ios-slider-toggle { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #e9e9ea; transition: .4s; border-radius: 31px; }
       .ios-slider-toggle:before { position: absolute; content: ''; height: 27px; width: 27px; left: 2px; bottom: 2px; background-color: white; transition: .4s; border-radius: 50%; box-shadow: 0 2px 4px rgba(0,0,0,0.2); }
       .ios-switch input:checked + .ios-slider-toggle { background-color: #34c759; }
       .ios-switch input:checked + .ios-slider-toggle:before { transform: translateX(20px); }
-
-      /* ========================================================= */
-      /* --- 核心动画与动态风险状态 UI (依据 Medium 最长字符适配) --- */
-      /* ========================================================= */
-      
       @keyframes glow-low { 0% { box-shadow: 0 0 0 0 rgba(52, 199, 89, 0.5); } 70% { box-shadow: 0 0 0 15px rgba(52, 199, 89, 0); } 100% { box-shadow: 0 0 0 0 rgba(52, 199, 89, 0); } }
       @keyframes glow-medium { 0% { box-shadow: 0 0 0 0 rgba(255, 204, 0, 0.6); } 70% { box-shadow: 0 0 0 15px rgba(255, 204, 0, 0); } 100% { box-shadow: 0 0 0 0 rgba(255, 204, 0, 0); } }
       @keyframes glow-high { 0% { box-shadow: 0 0 0 0 rgba(255, 59, 48, 0.6); } 70% { box-shadow: 0 0 0 15px rgba(255, 59, 48, 0); } 100% { box-shadow: 0 0 0 0 rgba(255, 59, 48, 0); } }
-
-      .risk-indicator { 
-        position: fixed; top: 16px; left: 12px; height: 46px; width: 46px; z-index: 999999 !important; 
-        background: var(--ios-glass-bg) !important; backdrop-filter: var(--ios-glass-blur); 
-        -webkit-backdrop-filter: var(--ios-glass-blur); border: var(--ios-glass-border); border-radius: 23px; 
-        box-shadow: var(--ios-glass-shadow); padding: 0; outline: none; cursor: pointer; transform: translateZ(0); 
-        display: flex; align-items: center; justify-content: center;
-        /* 加入 width 过渡，保证拉伸丝滑 */
-        transition: width 0.4s cubic-bezier(0.19, 1, 0.22, 1), transform 0.6s cubic-bezier(0.19, 1, 0.22, 1), border-color 0.4s ease; 
-      }
-      
-      .risk-indicator.panel-open { 
-        transform: translateY(-100px) scale(0.8); pointer-events: none; 
-      }
-      
-      /* 当赋予 risk-active 时，开始拉伸变长，针对 Medium 修改宽度 */
-      .risk-indicator.risk-active {
-        width: 125px;
-      }
-      
-      /* 文字默认状态：无宽度、全透明、无边距 (隐藏在图标后面) */
-      #risk_text {
-        max-width: 0; opacity: 0; overflow: hidden; white-space: nowrap; 
-        font-weight: 800; font-size: 16px; margin-left: 0;
-        transition: max-width 0.4s ease, opacity 0.3s ease, margin-left 0.3s ease, color 0.4s ease;
-      }
-      
-      /* 当赋予 risk-active 时，文字展开显示在图标后面 */
-      .risk-indicator.risk-active #risk_text {
-        max-width: 75px; opacity: 1; margin-left: 6px;
-      }
-
-      /* 具体的颜色状态映射 (边框、图标、文字) */
+      .risk-indicator { position: fixed; top: 16px; left: 12px; height: 46px; width: 46px; z-index: 999999 !important; background: var(--ios-glass-bg) !important; backdrop-filter: var(--ios-glass-blur); -webkit-backdrop-filter: var(--ios-glass-blur); border: var(--ios-glass-border); border-radius: 23px; box-shadow: var(--ios-glass-shadow); padding: 0; outline: none; cursor: pointer; transform: translateZ(0); display: flex; align-items: center; justify-content: center; transition: width 0.4s cubic-bezier(0.19, 1, 0.22, 1), transform 0.6s cubic-bezier(0.19, 1, 0.22, 1), border-color 0.4s ease; }
+      .risk-indicator.panel-open { transform: translateY(-100px) scale(0.8); pointer-events: none; }
+      .risk-indicator.risk-active { width: 125px; }
+      #risk_text { max-width: 0; opacity: 0; overflow: hidden; white-space: nowrap; font-weight: 800; font-size: 16px; margin-left: 0; transition: max-width 0.4s ease, opacity 0.3s ease, margin-left 0.3s ease, color 0.4s ease; }
+      .risk-indicator.risk-active #risk_text { max-width: 75px; opacity: 1; margin-left: 6px; }
       .risk-low { animation: glow-low 2s infinite; border: 1px solid rgba(52,199,89,0.5) !important; }
       .risk-low .material-symbols-rounded, .risk-low #risk_text { color: #34c759 !important; }
-
       .risk-medium { animation: glow-medium 1.5s infinite; border: 1px solid rgba(255,204,0,0.5) !important; }
       .risk-medium .material-symbols-rounded, .risk-medium #risk_text { color: #ffcc00 !important; }
-
       .risk-high { animation: glow-high 1s infinite; border: 1px solid rgba(255,59,48,0.5) !important; }
       .risk-high .material-symbols-rounded, .risk-high #risk_text { color: #ff3b30 !important; }
-
-      /* --- 其他底部组件和面板 --- */
-      .fg-bottombar { 
-        position: fixed; bottom: 32px; left: 0; right: 0; z-index: 999998 !important; display: flex; 
-        align-items: center; justify-content: center; gap: 14px; pointer-events: none; 
-        transition: transform 0.6s cubic-bezier(0.19, 1, 0.22, 1); 
-      }
-      .fg-bottombar.panel-open, .fg-bottombar.nav-active { 
-        transform: translateY(150px); pointer-events: none; transition: transform 0.4s cubic-bezier(0.19, 1, 0.22, 1); 
-      }
-
-      .fg-iconbtn, .fg-search-trigger { 
-        pointer-events: auto; background: var(--ios-glass-bg) !important; backdrop-filter: var(--ios-glass-blur); 
-        -webkit-backdrop-filter: var(--ios-glass-blur); border: var(--ios-glass-border); box-shadow: var(--ios-glass-shadow); transform: translateZ(0); 
-      }
-      .fg-iconbtn { 
-        width: 46px; height: 46px; border-radius: 23px; display: flex; align-items: center; justify-content: center; border:none; outline: none;
-      }
-      .fg-search-trigger { 
-        width: 65%; max-width: 320px; height: 46px; border-radius: 23px; display: flex; justify-content: space-between; 
-        align-items: center; padding: 0 16px 0 20px; color: #666; font-size: 16px; font-weight: 500; cursor: pointer; 
-      }
-
-      .loc-btn { 
-        position: fixed; right: 12px; bottom: 100px; z-index: 999997 !important; width: 46px; height: 46px; 
-        border-radius: 23px; display: flex; align-items: center; justify-content: center; 
-        background: var(--ios-glass-bg) !important; backdrop-filter: var(--ios-glass-blur); 
-        -webkit-backdrop-filter: var(--ios-glass-blur); border: var(--ios-glass-border); 
-        box-shadow: var(--ios-glass-shadow); cursor: pointer; outline: none; border: none; transition: transform 0.6s cubic-bezier(0.19, 1, 0.22, 1); 
-      }
+      .fg-bottombar { position: fixed; bottom: 32px; left: 0; right: 0; z-index: 999998 !important; display: flex; align-items: center; justify-content: center; gap: 14px; pointer-events: none; transition: transform 0.6s cubic-bezier(0.19, 1, 0.22, 1); }
+      .fg-bottombar.panel-open, .fg-bottombar.nav-active { transform: translateY(150px); pointer-events: none; transition: transform 0.4s cubic-bezier(0.19, 1, 0.22, 1); }
+      .fg-iconbtn, .fg-search-trigger { pointer-events: auto; background: var(--ios-glass-bg) !important; backdrop-filter: var(--ios-glass-blur); -webkit-backdrop-filter: var(--ios-glass-blur); border: var(--ios-glass-border); box-shadow: var(--ios-glass-shadow); transform: translateZ(0); transition: opacity 0.3s; }
+      .fg-iconbtn { width: 46px; height: 46px; border-radius: 23px; display: flex; align-items: center; justify-content: center; border:none; outline: none; }
+      .fg-search-trigger { width: 65%; max-width: 320px; height: 46px; border-radius: 23px; display: flex; justify-content: space-between; align-items: center; padding: 0 16px 0 20px; color: #666; font-size: 16px; font-weight: 500; cursor: pointer; }
+      .loc-btn { position: fixed; right: 12px; bottom: 100px; z-index: 999997 !important; width: 46px; height: 46px; border-radius: 23px; display: flex; align-items: center; justify-content: center; background: var(--ios-glass-bg) !important; backdrop-filter: var(--ios-glass-blur); -webkit-backdrop-filter: var(--ios-glass-blur); border: var(--ios-glass-border); box-shadow: var(--ios-glass-shadow); cursor: pointer; outline: none; border: none; transition: transform 0.6s cubic-bezier(0.19, 1, 0.22, 1); }
       .loc-btn.panel-open { transform: translateX(100px); pointer-events: none; }
-
-      .nav-info-panel { 
-        position: fixed; bottom: 32px; left: 16px; right: 16px; max-width: 400px; margin: 0 auto; 
-        z-index: 999998 !important; background: var(--ios-glass-bg) !important; backdrop-filter: var(--ios-glass-blur); 
-        -webkit-backdrop-filter: var(--ios-glass-blur); border: var(--ios-glass-border); border-radius: 24px; 
-        box-shadow: var(--ios-glass-shadow); display: flex; justify-content: space-between; align-items: center; 
-        padding: 12px 20px; transform: translateY(150px); pointer-events: none; transition: transform 0.6s cubic-bezier(0.19, 1, 0.22, 1); 
-      }
+      .nav-info-panel { position: fixed; bottom: 32px; left: 16px; right: 16px; max-width: 400px; margin: 0 auto; z-index: 999998 !important; background: var(--ios-glass-bg) !important; backdrop-filter: var(--ios-glass-blur); -webkit-backdrop-filter: var(--ios-glass-blur); border: var(--ios-glass-border); border-radius: 24px; box-shadow: var(--ios-glass-shadow); display: flex; justify-content: space-between; align-items: center; padding: 12px 20px; transform: translateY(150px); pointer-events: none; transition: transform 0.6s cubic-bezier(0.19, 1, 0.22, 1); }
       .nav-info-panel.active { transform: translateY(0); pointer-events: auto; }
-      
       .nav-text-container { display: flex; align-items: baseline; gap: 8px; }
       .nav-time { font-size: 24px; font-weight: 800; color: #34c759; }
       .nav-dist { font-size: 16px; font-weight: 600; color: #8E8E93; }
-
-      .end-nav-btn { background: #FF3B30 !important; color: #fff !important; border: none !important; border-radius: 16px !important; padding: 8px 20px !important; font-size: 16px !important; font-weight: 700 !important; cursor: pointer; outline: none !important; box-shadow: 0 4px 10px rgba(255,59,48,0.3) !important; -webkit-tap-highlight-color: transparent !important; transition: transform 0.15s ease, opacity 0.15s ease !important; }
+      .end-nav-btn { background: #FF3B30 !important; color: #fff !important; border: none !important; border-radius: 16px !important; padding: 8px 20px !important; font-size: 16px !important; font-weight: 700 !important; cursor: pointer; outline: none !important; box-shadow: 0 4px 10px rgba(255,59,48,0.3) !important; transition: transform 0.15s ease, opacity 0.15s ease !important; }
       .end-nav-btn:active { transform: scale(0.92) !important; opacity: 0.8 !important; }
-
-      .get-dir-btn { background: #007AFF !important; color: #fff !important; border: none !important; border-radius: 14px !important; font-size: 16px !important; font-weight: 700 !important; cursor: pointer; outline: none !important; box-shadow: 0 2px 5px rgba(0,122,255,0.3) !important; width: 100% !important; margin-top: 15px !important; height: 46px !important; -webkit-tap-highlight-color: transparent !important; transition: transform 0.15s ease, opacity 0.15s ease !important; }
+      .get-dir-btn { background: #007AFF !important; color: #fff !important; border: none !important; border-radius: 14px !important; font-size: 16px !important; font-weight: 700 !important; cursor: pointer; outline: none !important; box-shadow: 0 2px 5px rgba(0,122,255,0.3) !important; width: 100% !important; margin-top: 15px !important; height: 46px !important; transition: transform 0.15s ease, opacity 0.15s ease !important; }
       .get-dir-btn:active { transform: scale(0.95) !important; opacity: 0.85 !important; }
-
       .search-box-group { background: rgba(0,0,0,0.04); border-radius: 18px; padding: 6px; }
       .search-input-wrapper { position: relative; width: 100%; }
       .custom-search-input { background: #E5E5EA !important; border: none !important; height: 44px !important; padding: 0 40px 0 16px !important; font-size: 16px !important; color: #000 !important; width: 100% !important; box-sizing: border-box !important; outline: none !important; box-shadow: none !important; -webkit-appearance: none !important; appearance: none !important; transition: background 0.3s;}
       .custom-search-input:focus { background: #D1D1D6 !important; }
-      .custom-search-input::-webkit-search-decoration, .custom-search-input::-webkit-search-cancel-button, .custom-search-input::-webkit-search-results-button, .custom-search-input::-webkit-search-results-decoration { display: none !important; }
       .input-top { border-radius: 14px 14px 4px 4px !important; margin-bottom: 2px; }
       .input-bottom { border-radius: 4px 4px 14px 14px !important; }
       .search-icon-right { position: absolute; right: 10px; top: 50%; transform: translateY(-50%); color: #007AFF; font-size: 26px; pointer-events: auto; z-index: 10; cursor: pointer; padding: 5px; border-radius: 50%; }
-      
       .suggestions-container { margin-top: 10px; background: rgba(255, 255, 255, 0.75); border-radius: 14px; max-height: 250px; overflow-y: auto; display: none; flex-direction: column; box-shadow: 0 4px 15px rgba(0,0,0,0.1); border: var(--ios-glass-border); }
       .suggestions-container.active { display: flex; }
       .suggestion-item { padding: 12px 16px; border-bottom: 0.5px solid rgba(0,0,0,0.1); display: flex; flex-direction: row; justify-content: space-between; align-items: center; cursor: pointer; }
@@ -348,11 +245,16 @@ ui <- f7Page(
       .suggestion-text { display: flex; flex-direction: column; flex: 1; padding-right: 12px; overflow: hidden; text-align: left !important; align-items: flex-start !important; }
       .sugg-title { font-size: 16px; font-weight: 600; color: #000; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
       .sugg-sub { font-size: 12px; color: #8E8E93; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px; max-width: 100%; }
-
       .ios-map-label { background: transparent !important; border: none !important; box-shadow: none !important; font-size: 18px !important; font-weight: 800 !important; color: #1c1c1e !important; text-shadow: 0px 0px 6px rgba(255,255,255,0.9), 0px 0px 10px rgba(255,255,255,1), 0px 0px 3px rgba(255,255,255,1) !important; padding: 0 !important; }
       #global_overlay { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(0, 0, 0, 0.05); backdrop-filter: blur(8px); z-index: 10000; opacity: 0; pointer-events: none; transition: opacity 0.4s ease; }
-      #global_overlay.active { opacity: 1; pointer-events: auto; }"))
+      #global_overlay.active { opacity: 1; pointer-events: auto; }
+      .ios-toast { position: fixed; top: 60px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.8); color: white; padding: 12px 24px; border-radius: 20px; z-index: 100000; font-size: 14px; font-weight: 600; opacity: 0; pointer-events: none; transition: opacity 0.3s ease; white-space: nowrap; box-shadow: 0 4px 15px rgba(0,0,0,0.2); }
+      .ios-toast.show { opacity: 1; }
+      "))
   ),
+
+  # 顶层提示弹窗
+  div(id = "fg-toast", class = "ios-toast", "Toast Message"),
 
   div(id = "fg-map", leafletOutput("map", height = "100%")),
   div(id = "global_overlay", onclick = "Shiny.setInputValue('close_all', Math.random())"),
@@ -363,18 +265,16 @@ ui <- f7Page(
     tags$span(class = "material-symbols-rounded", style="color: #007AFF; font-size: 26px;", "my_location")
   ),
 
-  # --- 3. 警告面板 ---
   div(id = "risk_panel", class = "ios-panel",
     div(class = "settings-view",
       div(class = "panel-header", style = "margin-bottom: 12px;", tags$h2(class = "panel-title", "Alerts"), tags$button(id="c1", class="action-button panel-close-btn", "✕")),
       div(class = "ios-section-title", "LIVE MAP"),
-      div(class = "ios-group", div(class = "ios-row no-click", div(class = "ios-row-title", "Traffic Stop Heatmap"), tags$label(class = "ios-switch", tags$input(type = "checkbox", onchange = "Shiny.setInputValue('show_heatmap', this.checked)"), tags$span(class = "ios-slider-toggle")))),
+      div(class = "ios-group", div(class = "ios-row no-click", div(class = "ios-row-title", "Risk Spot"), tags$label(class = "ios-switch", tags$input(id = "chk_risk_spot", type = "checkbox", onchange = "Shiny.setInputValue('show_heatmap', this.checked)"), tags$span(class = "ios-slider-toggle")))),
       div(class = "ios-section-title", "AI DRIVING ASSISTANT"),
       div(class = "ios-group", div(style = "padding: 20px; min-height: 80px; display: flex; flex-direction: column; justify-content: center; align-items: center;", div(style = "color: #8E8E93; font-size: 15px; text-align: center; font-style: italic;", "AI Speed Recommendation will appear here...")))
     )
   ),
 
-  # --- 4. 设置面板 ---
   div(id = "settings_panel", class = "ios-panel",
     div(id = "settings_main", class = "settings-view",
       div(class = "panel-header", style = "margin-bottom: 12px;", tags$h2(class = "panel-title", "Settings"), tags$button(id="c2", class="action-button panel-close-btn", "✕")),
@@ -395,27 +295,16 @@ ui <- f7Page(
     )
   ),
 
-  # --- 5. 搜索面板 ---
   div(id = "search_panel", class = "ios-panel",
     div(class = "panel-header", style = "margin-bottom: 12px;", tags$h2(class = "panel-title", "Directions"), tags$button(id="c3", class="action-button panel-close-btn", "✕")),
-    
     div(class = "search-box-group",
-        div(class = "search-input-wrapper",
-            tags$input(id = "start_input", type = "text", class = "custom-search-input input-top", 
-                       value = "Current Location", placeholder = "Start Location", autocomplete = "off")
-        ),
-        div(class = "search-input-wrapper",
-            tags$input(id = "q_input", type = "text", class = "custom-search-input input-bottom", 
-                       placeholder = "Destination", autocomplete = "off"),
-            tags$span(class = "material-symbols-rounded search-icon-right", "search", onclick = "triggerCustomRoute()")
-        )
+        div(class = "search-input-wrapper", tags$input(id = "start_input", type = "text", class = "custom-search-input input-top", value = "Current Location", placeholder = "Start Location", autocomplete = "off")),
+        div(class = "search-input-wrapper", tags$input(id = "q_input", type = "text", class = "custom-search-input input-bottom", placeholder = "Destination", autocomplete = "off"), tags$span(class = "material-symbols-rounded search-icon-right", "search", onclick = "triggerCustomRoute()"))
     ),
-    
     tags$button(class = "get-dir-btn", onclick = "triggerCustomRoute()", "Get Directions"),
     div(id = "search_suggestions", class = "suggestions-container")
   ),
 
-  # 【核心修改】：风险按钮加入了包裹文字的 #risk_text 结构
   tags$button(id = "risk_btn", class = "action-button risk-indicator", 
     tags$span(class = "material-symbols-rounded", "siren_question"),
     tags$span(id = "risk_text", "Low")
