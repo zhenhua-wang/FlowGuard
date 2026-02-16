@@ -253,7 +253,6 @@ server <- function(input, output, session) {
     pred <- predict_lgcp(pp_rv(), xmin = as.numeric(bb["xmin"]), xmax = as.numeric(bb["xmax"]), ymin = as.numeric(bb["ymin"]), ymax = as.numeric(bb["ymax"]), npred = 200)
     r_m <- terra::rast(pred[, c("x", "y", "p")], type = "xyz")
     terra::crs(r_m) <- model_crs$wkt
-    # mean_lambda <- mean(terra::values(r_m, mat = FALSE), na.rm = TRUE)
     rr_m <- r_m / mean_lambda
     
     curr_rr <- terra::extract(rr_m, terra::vect(curr_pt))[, 2]
