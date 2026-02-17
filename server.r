@@ -227,7 +227,8 @@ server <- function(input, output, session) {
     ymin <- as.numeric(bb["ymin"]) - 5000
     ymax <- as.numeric(bb["ymax"]) + 5000
     
-    pred <- predict_lgcp(pp_rv(), xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, npred = 500)
+    # 【性能解药】：将 npred 由 500 降为 150，计算节点减少 91%，极大缩短启动时间
+    pred <- predict_lgcp(pp_rv(), xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, npred = 150)
     r_m <- terra::rast(pred[, c("x", "y", "p")], type = "xyz")
     terra::crs(r_m) <- model_crs$wkt
     
@@ -517,7 +518,6 @@ server <- function(input, output, session) {
       ui_text <- gsub("\\*\\*(?i)Suggestion:\\*\\*|(?i)Suggestion:|\\*\\*(?i)Advice:\\*\\*|(?i)Advice:", "<b>Suggestion:</b>", ui_text)
       ui_text <- gsub("\\n", "<br/>", ui_text)
       
-      # 【核心新增】：拆解 AI 文本，重组成一句自然且连贯的英语用于 TTS 播报
       speed_val <- "unknown"
       sugg_val <- "Drive safely."
       
@@ -530,10 +530,8 @@ server <- function(input, output, session) {
          }
       }
       
-      # 拼接为完整的一句话
       speak_sentence <- sprintf("Risk level is %s. Suggested speed is %s. %s", current_tier, speed_val, sugg_val)
       
-      # 将结构化信息发送给前端（包括文本、播报音频字符串、以及绝对风险层级）
       session$sendCustomMessage("update_ai_advice", list(text = ui_text, speak_text = speak_sentence, level = current_tier))
       session$sendCustomMessage("update_risk_level", list(level = current_tier))
       
