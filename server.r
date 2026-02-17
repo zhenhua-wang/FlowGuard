@@ -144,7 +144,7 @@ get_bearing <- function(lon1, lat1, lon2, lat2) {
   return((bearing + 360) %% 360)
 }
 
-function(input, output, session) {
+server <- function(input, output, session) {
   
   current_location <- reactiveVal(c(lon = -92.3341, lat = 38.9517))
   current_date <- mdy("1/24/2021") 
@@ -161,6 +161,10 @@ function(input, output, session) {
   
   is_navigating <- reactiveVal(FALSE)
   current_route_sf <- reactiveVal(NULL)
+  
+  # 【新增】：缓冲队列，用于延迟加载路线图层
+  pending_route_sf <- reactiveVal(NULL) 
+  
   view_mode <- reactiveVal("centered") 
   route_bearing <- reactiveVal(0)
   route_bounds <- reactiveVal(NULL)
@@ -170,6 +174,7 @@ function(input, output, session) {
   last_agent_eval_state <- reactiveVal(list(
       tier = "", 
       tolerance = "", 
+      road_info = "",
       parsed_level = "Low",
       thresh_med = 1.0e-07,
       thresh_high = 1.0e-06
@@ -213,6 +218,23 @@ function(input, output, session) {
 
   pp_rv  <- reactive({ req(model_fit()); model_fit()$pp })
   dat_rv <- reactive({ req(model_fit()); model_fit()$dat })
+
+  global_risk_raster <- reactive({
+    req(pp_rv(), dat_rv())
+    pts <- st_as_sf(dat_rv(), coords = c("x", "y"), crs = model_crs)
+    bb <- st_bbox(pts)
+    
+    xmin <- as.numeric(bb["xmin"]) - 5000
+    xmax <- as.numeric(bb["xmax"]) + 5000
+    ymin <- as.numeric(bb["ymin"]) - 5000
+    ymax <- as.numeric(bb["ymax"]) + 5000
+    
+    pred <- predict_lgcp(pp_rv(), xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, npred = 500)
+    r_m <- terra::rast(pred[, c("x", "y", "p")], type = "xyz")
+    terra::crs(r_m) <- model_crs$wkt
+    
+    return(r_m)
+  })
 
   output$map <- renderLeaflet({
     loc <- isolate(current_location())
@@ -310,6 +332,7 @@ function(input, output, session) {
   observeEvent(input$trigger_end_nav, {
     is_navigating(FALSE)
     current_route_sf(NULL) 
+    pending_route_sf(NULL)
     route_bounds(NULL)
     view_mode("centered")
     
@@ -378,45 +401,61 @@ function(input, output, session) {
       )
       route_bounds(bnd)
       
+      # 1. 瞬间执行：画路线、放缩地图、旋转视角
       map_proxy %>% 
         addPolylines(lng = coords[,1], lat = coords[,2], color = "#007AFF", weight = 6, opacity = 0.8, group = "search_res", options = pathOptions(pane = "route_pane")) %>%
         setView(lng = start_loc["lon"], lat = start_loc["lat"], zoom = 18)
       
       session$sendCustomMessage("start_nav_ui", list(dist = round(route_data$dist / 1609.34, 1), time = max(1, round(route_data$time / 60))))
       session$sendCustomMessage("set_map_rotation", list(deg = -bearing, mode = "centered"))
-      shinyjs::runjs("$('#chk_risk_spot').prop('checked', true); Shiny.setInputValue('show_heatmap', true);")
       
+      # 2. 准备数据，暂存而不立即触发渲染
       rc <- data.frame(lng = route_data$coords[,1], lat = route_data$coords[,2])
       ln_ll <- st_sfc(st_linestring(as.matrix(rc[, c("lng", "lat")])), crs = 4326)
       ln_m <- st_transform(ln_ll, model_crs)
-      current_route_sf(ln_m) 
+      
+      pending_route_sf(ln_m) 
+      
+      # 3. 延迟触发：给地图 800 毫秒的物理平滑过渡时间，之后再让 R 去算复杂的 AI 风险
+      shinyjs::runjs("
+        setTimeout(function() {
+          Shiny.setInputValue('apply_pending_route', Math.random());
+          if (!$('#chk_risk_spot').is(':checked')) {
+             $('#chk_risk_spot').prop('checked', true); 
+             Shiny.setInputValue('show_heatmap', true);
+          }
+        }, 800);
+      ")
+      
     } else {
       shinyjs::runjs("alert('Could not generate driving route between these locations.');")
       map_proxy %>% setView(lng = dest_loc["lon"], lat = dest_loc["lat"], zoom = 15)
     }
   })
 
-  observeEvent(list(input$show_heatmap, pp_rv(), current_location(), input$risk), {
+  # 【新增的解耦触发器】：等待地图渲染完毕后，才将被压后的路线数据赋值出去，触发全线风险计算
+  observeEvent(input$apply_pending_route, {
+      req(pending_route_sf())
+      current_route_sf(pending_route_sf())
+  })
+
+  observeEvent(list(input$show_heatmap, global_risk_raster(), current_location(), input$risk), {
     
     if (is.null(input$show_heatmap) || !input$show_heatmap) {
       session$sendCustomMessage("update_risk_level", list(level = "Off"))
       session$sendCustomMessage("update_ai_advice", list(text = "Please turn on 'Risk Spot' or start navigation to view AI suggestions."))
       leafletProxy("map") %>% clearGroup("current_risk_halo")
       
-      last_agent_eval_state(list(tier = "", tolerance = "", parsed_level = "Low", thresh_med = 1.0e-07, thresh_high = 1.0e-06))
+      last_agent_eval_state(list(tier = "", tolerance = "", road_info = "", parsed_level = "Low", thresh_med = 1.0e-07, thresh_high = 1.0e-06))
       return()
     }
     
-    req(pp_rv())
+    req(global_risk_raster())
     map_proxy <- leafletProxy("map")
     loc <- current_location()
     curr_pt <- st_sfc(st_point(c(loc["lon"], loc["lat"])), crs=4326) %>% st_transform(model_crs)
     
-    bb_curr <- st_bbox(st_buffer(curr_pt, 500))
-    pred <- predict_lgcp(pp_rv(), xmin = as.numeric(bb_curr["xmin"]), xmax = as.numeric(bb_curr["xmax"]), ymin = as.numeric(bb_curr["ymin"]), ymax = as.numeric(bb_curr["ymax"]), npred = 50)
-    r_m <- terra::rast(pred[, c("x", "y", "p")], type = "xyz")
-    terra::crs(r_m) <- model_crs$wkt
-    
+    r_m <- global_risk_raster()
     curr_rr_raw <- terra::extract(r_m, terra::vect(curr_pt))
     curr_raw_val <- 0.0
     if (!is.null(curr_rr_raw) && nrow(curr_rr_raw) > 0) {
@@ -437,17 +476,21 @@ function(input, output, session) {
         current_tier <- "Medium"
     }
     
-    state_changed <- (old_state$tier != current_tier) || (old_state$tolerance != user_risk_tolerance)
+    current_road_info <- get_road_info(loc["lat"], loc["lon"])
+    
+    state_changed <- (old_state$tier != current_tier) || 
+                     (old_state$tolerance != user_risk_tolerance) || 
+                     (old_state$road_info != current_road_info)
+                     
     parsed_level <- old_state$parsed_level 
     
     if (state_changed) {
       current_time_str <- format(Sys.time(), "%I:%M %p")
       weather_cond <- get_weather(loc["lat"], loc["lon"])
-      road_info <- get_road_info(loc["lat"], loc["lon"])
       
       agent_input <- sprintf(
-        "Real-time INPUT CONTEXT:\n- Raw Spatial Risk Score: %e\n- User Risk Tolerance: %s\n- Location: [%f, %f]\n- Current Time: %s\n- Weather: %s\n- %s",
-        curr_raw_val, user_risk_tolerance, loc["lat"], loc["lon"], current_time_str, weather_cond, road_info
+        "Real-time INPUT CONTEXT:\n- Raw Spatial Risk Score: %e\n- User Risk Tolerance: %s\n- Location: [%f, %f]\n- Current Time: %s\n- Weather: %s\n- Current Road Info: %s",
+        curr_raw_val, user_risk_tolerance, loc["lat"], loc["lon"], current_time_str, weather_cond, current_road_info
       )
       
       session$sendCustomMessage("update_ai_advice", list(text = "TraffIQ is analyzing environment context..."))
@@ -488,6 +531,7 @@ function(input, output, session) {
       last_agent_eval_state(list(
           tier = current_tier, 
           tolerance = user_risk_tolerance, 
+          road_info = current_road_info,
           parsed_level = current_tier,
           thresh_med = dyn_thresh_med,
           thresh_high = dyn_thresh_high
@@ -508,7 +552,7 @@ function(input, output, session) {
     }
   }, ignoreInit = TRUE)
 
-  observeEvent(list(input$show_heatmap, current_route_sf(), pp_rv(), input$risk), {
+  observeEvent(list(input$show_heatmap, current_route_sf(), global_risk_raster(), input$risk), {
     
     map_proxy <- leafletProxy("map")
     
@@ -516,22 +560,19 @@ function(input, output, session) {
       map_proxy %>% clearGroup("risk_halos")
       return()
     }
-    req(pp_rv())
+    req(global_risk_raster())
 
     if (is_navigating() && !is.null(current_route_sf())) {
       map_proxy %>% clearGroup("risk_halos")
       
       road_m <- current_route_sf()
-      bb_route <- st_bbox(st_buffer(road_m, dist = buffer_radius + 10))
-      
-      pred <- predict_lgcp(pp_rv(), xmin = as.numeric(bb_route["xmin"]), xmax = as.numeric(bb_route["xmax"]), ymin = as.numeric(bb_route["ymin"]), ymax = as.numeric(bb_route["ymax"]), npred = 200)
-      r_m <- terra::rast(pred[, c("x", "y", "p")], type = "xyz")
-      terra::crs(r_m) <- model_crs$wkt
       
       sample_pts_m <- tryCatch({ st_line_sample(road_m, density = 1/50) }, error = function(e) NULL)
       
       if (!is.null(sample_pts_m) && length(sample_pts_m) > 0) {
         sample_pts_sf <- st_as_sf(st_cast(sample_pts_m, "POINT"))
+        
+        r_m <- global_risk_raster()
         extracted_raw <- terra::extract(r_m, terra::vect(sample_pts_sf))[,2]
         
         valid_raw <- extracted_raw[!is.na(extracted_raw)]
@@ -570,4 +611,5 @@ function(input, output, session) {
        map_proxy %>% clearGroup("risk_halos")
     }
   }, ignoreInit = TRUE)
+
 }
