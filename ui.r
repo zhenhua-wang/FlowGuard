@@ -106,6 +106,14 @@ f7Page(
           }, 400);
         });
         $(document).on('keyup', '#q_input, #start_input', function(e) { if(e.key === 'Enter' || e.keyCode === 13) { triggerCustomRoute(); $(this).blur(); } });
+        
+        // 提前触发语音库加载，避免第一次播报时找不到高质量声音
+        if ('speechSynthesis' in window) {
+            window.speechSynthesis.getVoices();
+            window.speechSynthesis.onvoiceschanged = function() {
+                window.speechSynthesis.getVoices();
+            };
+        }
       });
 
       $(document).on('shiny:connected', function() { 
@@ -185,6 +193,50 @@ f7Page(
 
       Shiny.addCustomMessageHandler('update_ai_advice', function(msg) {
          $('#ai_advice_text').html(msg.text).css({ 'font-style': 'normal', 'color': '#000', 'text-align': 'left', 'line-height': '1.5' });
+         
+         if (msg.speak_text) {
+             let wantsSound = $('.ios-row[data-val=\"Sound\"]').hasClass('selected');
+             let wantsVibe = $('.ios-row[data-val=\"Vibrate\"]').hasClass('selected');
+             
+             if (wantsVibe && navigator.vibrate) {
+                 if (msg.level === 'High') {
+                     navigator.vibrate([300, 100, 300, 100, 300]); 
+                 } else if (msg.level === 'Medium') {
+                     navigator.vibrate([200, 100, 200]); 
+                 } else {
+                     navigator.vibrate([150]); 
+                 }
+             }
+             
+             // 智能挑选高质量原生语音
+             if (wantsSound && 'speechSynthesis' in window) {
+                 window.speechSynthesis.cancel(); 
+                 let utterance = new SpeechSynthesisUtterance(msg.speak_text);
+                 utterance.lang = 'en-US';
+                 utterance.rate = 1.0;  // 恢复为正常语速，高质量语音加速容易失真
+                 
+                 let voices = window.speechSynthesis.getVoices();
+                 if (voices.length > 0) {
+                     let bestVoice = null;
+                     // 优先寻找各平台的增强/高质量自然语音 (Google, Apple Siri/Samantha, Microsoft Natural)
+                     let preferredNames = ['Google US English', 'Samantha', 'Siri', 'Alex', 'Microsoft Aria', 'Natural', 'Premium', 'Enhanced'];
+                     
+                     for (let i = 0; i < preferredNames.length; i++) {
+                         bestVoice = voices.find(v => v.name.includes(preferredNames[i]) && v.lang.includes('en'));
+                         if (bestVoice) break;
+                     }
+                     // 如果找不到特定的增强语音，则回退到首个英文语音
+                     if (!bestVoice) {
+                         bestVoice = voices.find(v => v.lang.startsWith('en'));
+                     }
+                     
+                     if (bestVoice) {
+                         utterance.voice = bestVoice;
+                     }
+                 }
+                 window.speechSynthesis.speak(utterance);
+             }
+         }
       });
     ")),
 
@@ -363,7 +415,6 @@ f7Page(
       div(class = "ios-group", div(class = "ios-row", onclick = "showSubView('settings_sub_alerts')", div(class = "ios-row-title", "Alerts"), div(class = "ios-row-val", tags$span(id="val_alerts", "Sound, Vibrate"), tags$span(class="ios-chevron", "›")))),
       div(class = "ios-section-title", "DATA TRACEBACK DAYS"),
       div(class = "ios-group", style = "overflow: visible;", div(class = "slider-row", tags$span(class = "slider-label", "1"), div(class = "slider-container", div(id = "slider_tooltip", class = "slider-tooltip", "5"), 
-      # 修改：默认 value 设为 5 
       tags$input(type = "range", class = "ios-slider", min = "1", max = "30", value = "5", oninput = "updateSliderColor(this)", onmouseup = "hideSliderTooltip()", ontouchend = "hideSliderTooltip()")), tags$span(class = "slider-label", "30"))),
       div(class = "ios-group", div(class = "ios-row no-click", div(class = "ios-row-title", "Show Traffic Stops"), tags$label(class = "ios-switch", tags$input(type = "checkbox", onchange = "Shiny.setInputValue('individual_case', this.checked)"), tags$span(class = "ios-slider-toggle")))),
       div(class = "ios-group", div(class = "ios-row", onclick = "showSubView('settings_sub_risk')", div(class = "ios-row-title", "Risk Tolerance"), div(class = "ios-row-val", tags$span(id="val_risk", "Moderate"), tags$span(class="ios-chevron", "›"))))

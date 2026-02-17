@@ -161,8 +161,6 @@ server <- function(input, output, session) {
   
   is_navigating <- reactiveVal(FALSE)
   current_route_sf <- reactiveVal(NULL)
-  
-  # 【新增】：缓冲队列，用于延迟加载路线图层
   pending_route_sf <- reactiveVal(NULL) 
   
   view_mode <- reactiveVal("centered") 
@@ -401,7 +399,6 @@ server <- function(input, output, session) {
       )
       route_bounds(bnd)
       
-      # 1. 瞬间执行：画路线、放缩地图、旋转视角
       map_proxy %>% 
         addPolylines(lng = coords[,1], lat = coords[,2], color = "#007AFF", weight = 6, opacity = 0.8, group = "search_res", options = pathOptions(pane = "route_pane")) %>%
         setView(lng = start_loc["lon"], lat = start_loc["lat"], zoom = 18)
@@ -409,14 +406,12 @@ server <- function(input, output, session) {
       session$sendCustomMessage("start_nav_ui", list(dist = round(route_data$dist / 1609.34, 1), time = max(1, round(route_data$time / 60))))
       session$sendCustomMessage("set_map_rotation", list(deg = -bearing, mode = "centered"))
       
-      # 2. 准备数据，暂存而不立即触发渲染
       rc <- data.frame(lng = route_data$coords[,1], lat = route_data$coords[,2])
       ln_ll <- st_sfc(st_linestring(as.matrix(rc[, c("lng", "lat")])), crs = 4326)
       ln_m <- st_transform(ln_ll, model_crs)
       
       pending_route_sf(ln_m) 
       
-      # 3. 延迟触发：给地图 800 毫秒的物理平滑过渡时间，之后再让 R 去算复杂的 AI 风险
       shinyjs::runjs("
         setTimeout(function() {
           Shiny.setInputValue('apply_pending_route', Math.random());
@@ -433,7 +428,6 @@ server <- function(input, output, session) {
     }
   })
 
-  # 【新增的解耦触发器】：等待地图渲染完毕后，才将被压后的路线数据赋值出去，触发全线风险计算
   observeEvent(input$apply_pending_route, {
       req(pending_route_sf())
       current_route_sf(pending_route_sf())
@@ -523,7 +517,24 @@ server <- function(input, output, session) {
       ui_text <- gsub("\\*\\*(?i)Suggestion:\\*\\*|(?i)Suggestion:|\\*\\*(?i)Advice:\\*\\*|(?i)Advice:", "<b>Suggestion:</b>", ui_text)
       ui_text <- gsub("\\n", "<br/>", ui_text)
       
-      session$sendCustomMessage("update_ai_advice", list(text = ui_text))
+      # 【核心新增】：拆解 AI 文本，重组成一句自然且连贯的英语用于 TTS 播报
+      speed_val <- "unknown"
+      sugg_val <- "Drive safely."
+      
+      lines_for_tts <- strsplit(clean_response, "\n")[[1]]
+      for (l in lines_for_tts) {
+         if (grepl("(?i)^\\*?\\*?Speed:", trimws(l))) {
+             speed_val <- trimws(sub("(?i)^\\*?\\*?Speed:\\*?\\*?\\s*", "", trimws(l)))
+         } else if (grepl("(?i)^\\*?\\*?(Suggestion|Advice):", trimws(l))) {
+             sugg_val <- trimws(sub("(?i)^\\*?\\*?(Suggestion|Advice):\\*?\\*?\\s*", "", trimws(l)))
+         }
+      }
+      
+      # 拼接为完整的一句话
+      speak_sentence <- sprintf("Risk level is %s. Suggested speed is %s. %s", current_tier, speed_val, sugg_val)
+      
+      # 将结构化信息发送给前端（包括文本、播报音频字符串、以及绝对风险层级）
+      session$sendCustomMessage("update_ai_advice", list(text = ui_text, speak_text = speak_sentence, level = current_tier))
       session$sendCustomMessage("update_risk_level", list(level = current_tier))
       
       parsed_level <- current_tier
